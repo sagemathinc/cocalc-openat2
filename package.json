@@ -1,0 +1,39 @@
+{
+  "name": "@cocalc/openat2",
+  "version": "0.1.0",
+  "description": "Linux openat2-based filesystem primitives for secure sandboxing",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node"
+  ],
+  "scripts": {
+    "build": "napi build --release",
+    "build:debug": "napi build",
+    "build:platform": "napi build --platform --release",
+    "test:node": "node --test test/*.test.cjs",
+    "test:rust": "cargo test",
+    "test": "pnpm run test:rust && pnpm run test:node",
+    "lint:rust": "cargo clippy --all-targets --all-features -- -D warnings"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.4"
+  },
+  "napi": {
+    "name": "cocalc_openat2",
+    "triples": {
+      "defaults": false,
+      "additional": [
+        "x86_64-unknown-linux-gnu",
+        "aarch64-unknown-linux-gnu"
+      ]
+    }
+  }
+}

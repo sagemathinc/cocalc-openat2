@@ -1,0 +1,27 @@
+[package]
+name = "cocalc-openat2"
+version = "0.1.0"
+edition = "2021"
+description = "Linux openat2-based sandbox filesystem primitives for Node.js via napi-rs"
+license = "MIT"
+repository = "https://github.com/sagemathinc/cocalc-openat2"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"
+napi = { version = "2", default-features = false, features = ["napi8"] }
+napi-derive = "2"
+thiserror = "1"
+
+[build-dependencies]
+napi-build = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
