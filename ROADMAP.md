@@ -37,15 +37,15 @@ Primary candidates to migrate first:
 
 ### M2: File content primitives
 
-- [ ] `open_read(path) -> fd`
-- [ ] `open_write(path, flags...) -> fd`
+- [x] `open_read(path) -> fd`
+- [x] `open_write(path, flags...) -> fd`
 - [ ] `open_parent(path) -> (dirfd, leaf)` optional internal helper only
 - [ ] Node fd handoff design (`napi::External` or numeric fd + ownership contract)
 
 ### M3: Copy and delete completeness
 
-- [ ] `copy_file(src, dst, reflink?)`
-- [ ] recursive delete (`rm -r`) implemented natively without unsafe path joins
+- [x] `copy_file(src, dst, reflink?)`
+- [x] recursive delete (`rm -r`) implemented natively without unsafe path joins
 - [ ] better errno/code mapping for all expected Node-style errors
 
 ### M4: CoCalc integration (lite4)

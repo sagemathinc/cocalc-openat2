@@ -120,6 +120,37 @@ impl SandboxRoot {
   }
 
   #[napi]
+  pub fn open_read(&self, path: String) -> Result<i32> {
+    self
+      .inner
+      .open_read_fd(&path)
+      .map(|fd| fd as i32)
+      .map_err(map_error)
+  }
+
+  #[napi]
+  pub fn open_write(
+    &self,
+    path: String,
+    create: Option<bool>,
+    truncate: Option<bool>,
+    append: Option<bool>,
+    mode: Option<u32>,
+  ) -> Result<i32> {
+    self
+      .inner
+      .open_write_fd(
+        &path,
+        create.unwrap_or(false),
+        truncate.unwrap_or(false),
+        append.unwrap_or(false),
+        mode.unwrap_or(0o666),
+      )
+      .map(|fd| fd as i32)
+      .map_err(map_error)
+  }
+
+  #[napi]
   pub fn rm(&self, path: String, recursive: Option<bool>, force: Option<bool>) -> Result<()> {
     self
       .inner

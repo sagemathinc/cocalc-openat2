@@ -71,6 +71,11 @@ Methods implemented now:
 - `rm(path, recursive?, force?)`
 - `utimes(path, atimeNs, mtimeNs)`
 - `stat(path)`
+- `openRead(path) -> fd`
+- `openWrite(path, create?, truncate?, append?, mode?) -> fd`
+
+`openRead`/`openWrite` return numeric file descriptors intended for high-frequency
+I/O paths in Node. The caller owns the descriptor and must close it.
 
 ## Security model
 

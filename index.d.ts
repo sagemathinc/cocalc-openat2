@@ -30,6 +30,8 @@ export declare class SandboxRoot {
   chmod(path: string, mode: number): void
   truncate(path: string, len: number): void
   copyFile(src: string, dest: string, mode?: number | undefined | null): void
+  openRead(path: string): number
+  openWrite(path: string, create?: boolean | undefined | null, truncate?: boolean | undefined | null, append?: boolean | undefined | null, mode?: number | undefined | null): number
   rm(path: string, recursive?: boolean | undefined | null, force?: boolean | undefined | null): void
   utimes(path: string, atimeNs: number, mtimeNs: number): void
   stat(path: string): StatResult

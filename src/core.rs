@@ -265,6 +265,53 @@ impl Sandbox {
     Ok(())
   }
 
+  pub fn open_read_fd(&self, path: &str) -> Result<RawFd, SandboxError> {
+    let fd = self.open_existing(path, libc::O_RDONLY)?;
+    Ok(fd.into_raw_fd())
+  }
+
+  pub fn open_write_fd(
+    &self,
+    path: &str,
+    create: bool,
+    truncate: bool,
+    append: bool,
+    mode: u32,
+  ) -> Result<RawFd, SandboxError> {
+    if truncate && append {
+      return Err(SandboxError::InvalidPath(
+        "open_write may not set both truncate and append".to_string(),
+      ));
+    }
+    let components = normalize_relative_components(path)?;
+    let (parent, leaf) = split_parent_leaf(&components)?;
+    let parent_fd = self.open_dir_from_root(parent.as_path())?;
+
+    let mut flags = libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    if create {
+      flags |= libc::O_CREAT;
+    }
+    if truncate {
+      flags |= libc::O_TRUNC;
+    }
+    if append {
+      flags |= libc::O_APPEND;
+    }
+
+    let fd = unsafe {
+      libc::openat(
+        parent_fd.as_raw_fd(),
+        leaf.as_ptr(),
+        flags,
+        mode as libc::mode_t,
+      )
+    };
+    if fd < 0 {
+      return Err(SandboxError::Io(io::Error::last_os_error()));
+    }
+    Ok(fd)
+  }
+
   pub fn utimes(&self, path: &str, atime_ns: i64, mtime_ns: i64) -> Result<(), SandboxError> {
     let fd = self.open_existing(path, libc::O_RDONLY)?;
     let atime = ns_to_timespec(atime_ns);
@@ -648,6 +695,7 @@ fn stat_from_libc(st: &libc::stat) -> FileStat {
 mod tests {
   use super::*;
   use std::fs;
+  use std::io::{Read, Write};
   use tempfile::tempdir;
 
   #[test]
@@ -764,5 +812,42 @@ mod tests {
 
     assert!(outside.path().join("secret.txt").exists());
     assert!(!root.path().join("d1").exists());
+  }
+
+  #[test]
+  fn open_read_fd_reads_expected_bytes() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("a.txt"), b"hello").unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    let fd = sandbox.open_read_fd("a.txt").unwrap();
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let mut value = String::new();
+    file.read_to_string(&mut value).unwrap();
+    assert_eq!(value, "hello");
+  }
+
+  #[test]
+  fn open_write_fd_create_and_append_work() {
+    let root = tempdir().unwrap();
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+
+    {
+      let fd = sandbox
+        .open_write_fd("log.txt", true, false, true, 0o644)
+        .unwrap();
+      let mut file = unsafe { File::from_raw_fd(fd) };
+      file.write_all(b"one\n").unwrap();
+    }
+    {
+      let fd = sandbox
+        .open_write_fd("log.txt", true, false, true, 0o644)
+        .unwrap();
+      let mut file = unsafe { File::from_raw_fd(fd) };
+      file.write_all(b"two\n").unwrap();
+    }
+
+    let data = fs::read_to_string(root.path().join("log.txt")).unwrap();
+    assert_eq!(data, "one\ntwo\n");
   }
 }

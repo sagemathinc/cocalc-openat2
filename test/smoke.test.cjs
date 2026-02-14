@@ -39,6 +39,33 @@ test('basic mkdir/rename/unlink/stat', () => {
   });
 });
 
+test('openRead/openWrite expose safe anchored file descriptors', () => {
+  withTempDir((dir) => {
+    const sandbox = new SandboxRoot(dir);
+
+    const fdWrite1 = sandbox.openWrite('io.txt', true, true, false, 0o644);
+    try {
+      fs.writeFileSync(fdWrite1, 'one');
+    } finally {
+      fs.closeSync(fdWrite1);
+    }
+
+    const fdWrite2 = sandbox.openWrite('io.txt', true, false, true, 0o644);
+    try {
+      fs.writeFileSync(fdWrite2, 'two');
+    } finally {
+      fs.closeSync(fdWrite2);
+    }
+
+    const fdRead = sandbox.openRead('io.txt');
+    try {
+      assert.equal(fs.readFileSync(fdRead, 'utf8'), 'onetwo');
+    } finally {
+      fs.closeSync(fdRead);
+    }
+  });
+});
+
 test('renameNoReplace preserves destination and returns EEXIST', () => {
   withTempDir((dir) => {
     const sandbox = new SandboxRoot(dir);
