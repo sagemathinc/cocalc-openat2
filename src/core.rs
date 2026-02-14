@@ -1,5 +1,7 @@
 use std::ffi::{CString, OsStr, OsString};
+use std::fs::File;
 use std::io;
+use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
@@ -158,6 +160,34 @@ impl Sandbox {
     Ok(())
   }
 
+  pub fn truncate(&self, path: &str, len: i64) -> Result<(), SandboxError> {
+    let fd = self.open_existing(path, libc::O_WRONLY)?;
+    let rc = unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) };
+    if rc < 0 {
+      return Err(SandboxError::Io(io::Error::last_os_error()));
+    }
+    Ok(())
+  }
+
+  pub fn copy_file(&self, src: &str, dest: &str, mode: u32) -> Result<(), SandboxError> {
+    let src_fd = self.open_existing(src, libc::O_RDONLY)?;
+    let src_stat = self.stat(src)?;
+    let dst_fd = self.open_for_create(dest, true, mode)?;
+
+    let mut src_file: File = src_fd.into();
+    let mut dst_file: File = dst_fd.into();
+    std::io::copy(&mut src_file, &mut dst_file)?;
+    dst_file.flush()?;
+
+    // Match source permissions as best-effort parity with copy behavior.
+    let rc = unsafe { libc::fchmod(dst_file.as_raw_fd(), src_stat.mode as libc::mode_t) };
+    if rc < 0 {
+      return Err(SandboxError::Io(io::Error::last_os_error()));
+    }
+
+    Ok(())
+  }
+
   pub fn utimes(&self, path: &str, atime_ns: i64, mtime_ns: i64) -> Result<(), SandboxError> {
     let fd = self.open_existing(path, libc::O_RDONLY)?;
     let atime = ns_to_timespec(atime_ns);
@@ -226,6 +256,35 @@ impl Sandbox {
       0,
       self.resolve_flags,
     )
+  }
+
+  fn open_for_create(
+    &self,
+    path: &str,
+    truncate: bool,
+    mode: u32,
+  ) -> Result<OwnedFd, SandboxError> {
+    let components = normalize_relative_components(path)?;
+    let (parent, leaf) = split_parent_leaf(&components)?;
+    let parent_fd = self.open_dir_from_root(parent.as_path())?;
+
+    let mut flags = libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    if truncate {
+      flags |= libc::O_TRUNC;
+    }
+
+    let fd = unsafe {
+      libc::openat(
+        parent_fd.as_raw_fd(),
+        leaf.as_ptr(),
+        flags,
+        mode as libc::mode_t,
+      )
+    };
+    if fd < 0 {
+      return Err(SandboxError::Io(io::Error::last_os_error()));
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
   }
 
   fn open_dir_from_root(&self, rel_dir: &Path) -> Result<OwnedFd, SandboxError> {
@@ -417,5 +476,18 @@ mod tests {
 
     assert!(!root.path().join("a.txt").exists());
     assert!(root.path().join("b.txt").exists());
+  }
+
+  #[test]
+  fn copy_and_truncate_work() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("a.txt"), b"abcdef").unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    sandbox.copy_file("a.txt", "b.txt", 0o644).unwrap();
+    sandbox.truncate("b.txt", 3).unwrap();
+
+    let value = fs::read(root.path().join("b.txt")).unwrap();
+    assert_eq!(&value, b"abc");
   }
 }

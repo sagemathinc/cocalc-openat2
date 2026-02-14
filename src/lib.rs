@@ -89,6 +89,19 @@ impl SandboxRoot {
   }
 
   #[napi]
+  pub fn truncate(&self, path: String, len: i64) -> Result<()> {
+    self.inner.truncate(&path, len).map_err(map_error)
+  }
+
+  #[napi]
+  pub fn copy_file(&self, src: String, dest: String, mode: Option<u32>) -> Result<()> {
+    self
+      .inner
+      .copy_file(&src, &dest, mode.unwrap_or(0o644))
+      .map_err(map_error)
+  }
+
+  #[napi]
   pub fn utimes(&self, path: String, atime_ns: i64, mtime_ns: i64) -> Result<()> {
     self
       .inner

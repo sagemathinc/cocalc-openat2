@@ -21,6 +21,10 @@ test('basic mkdir/rename/unlink/stat', () => {
     sandbox.mkdir('a/b', true);
     fs.writeFileSync(path.join(dir, 'a/b/file.txt'), 'hello');
 
+    sandbox.copyFile('a/b/file.txt', 'a/b/copy.txt');
+    sandbox.truncate('a/b/copy.txt', 2);
+    assert.equal(fs.readFileSync(path.join(dir, 'a/b/copy.txt'), 'utf8'), 'he');
+
     sandbox.rename('a/b/file.txt', 'a/b/file2.txt');
     const stat = sandbox.stat('a/b/file2.txt');
     assert.equal(stat.size, 5);

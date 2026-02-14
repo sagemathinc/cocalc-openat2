@@ -27,6 +27,8 @@ Methods implemented now:
 - `rmdir(path)`
 - `rename(oldPath, newPath)`
 - `chmod(path, mode)`
+- `truncate(path, len)`
+- `copyFile(src, dest, mode?)`
 - `utimes(path, atimeNs, mtimeNs)`
 - `stat(path)`
 
