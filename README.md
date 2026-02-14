@@ -62,9 +62,12 @@ Methods implemented now:
 - `unlink(path)`
 - `rmdir(path)`
 - `rename(oldPath, newPath)`
+- `renameNoReplace(oldPath, newPath)`
+- `link(oldPath, newPath)`
 - `chmod(path, mode)`
 - `truncate(path, len)`
 - `copyFile(src, dest, mode?)`
+- `rm(path, recursive?, force?)`
 - `utimes(path, atimeNs, mtimeNs)`
 - `stat(path)`
 

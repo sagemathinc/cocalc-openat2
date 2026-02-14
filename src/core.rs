@@ -1,8 +1,8 @@
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -176,6 +176,44 @@ impl Sandbox {
     Ok(())
   }
 
+  pub fn link(&self, old_path: &str, new_path: &str) -> Result<(), SandboxError> {
+    let old_components = normalize_relative_components(old_path)?;
+    let new_components = normalize_relative_components(new_path)?;
+
+    let (old_parent, old_leaf) = split_parent_leaf(&old_components)?;
+    let (new_parent, new_leaf) = split_parent_leaf(&new_components)?;
+
+    let old_parent_fd = self.open_dir_from_root(old_parent.as_path())?;
+    let new_parent_fd = self.open_dir_from_root(new_parent.as_path())?;
+
+    let rc = unsafe {
+      libc::linkat(
+        old_parent_fd.as_raw_fd(),
+        old_leaf.as_ptr(),
+        new_parent_fd.as_raw_fd(),
+        new_leaf.as_ptr(),
+        0,
+      )
+    };
+    if rc < 0 {
+      return Err(SandboxError::Io(io::Error::last_os_error()));
+    }
+    Ok(())
+  }
+
+  pub fn remove(&self, path: &str, recursive: bool, force: bool) -> Result<(), SandboxError> {
+    let components = normalize_relative_components(path)?;
+    let (parent, leaf) = split_parent_leaf(&components)?;
+    let parent_fd = self.open_dir_from_root_readable(parent.as_path())?;
+    remove_entry(
+      parent_fd.as_raw_fd(),
+      &leaf,
+      recursive,
+      force,
+      self.resolve_flags,
+    )
+  }
+
   pub fn chmod(&self, path: &str, mode: u32) -> Result<(), SandboxError> {
     let fd = self.open_existing(path, libc::O_RDONLY)?;
     let rc = unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) };
@@ -326,6 +364,22 @@ impl Sandbox {
       self.resolve_flags,
     )
   }
+
+  fn open_dir_from_root_readable(&self, rel_dir: &Path) -> Result<OwnedFd, SandboxError> {
+    let rel = if rel_dir.as_os_str().is_empty() {
+      CString::new(".")
+        .map_err(|_| SandboxError::InvalidPath("invalid root path".to_string()))?
+    } else {
+      cstring_from_os(rel_dir.as_os_str())?
+    };
+    openat2_fd(
+      self.root_fd.as_raw_fd(),
+      &rel,
+      libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+      0,
+      self.resolve_flags,
+    )
+  }
 }
 
 fn normalize_relative_components(path: &str) -> Result<Vec<OsString>, SandboxError> {
@@ -436,6 +490,119 @@ fn unlinkat(parent_fd: RawFd, leaf: &CString, flags: i32) -> Result<(), SandboxE
   Ok(())
 }
 
+fn remove_entry(
+  parent_fd: RawFd,
+  leaf: &CString,
+  recursive: bool,
+  force: bool,
+  resolve_flags: u64,
+) -> Result<(), SandboxError> {
+  if !recursive {
+    return match unlinkat(parent_fd, leaf, 0) {
+      Ok(()) => Ok(()),
+      Err(SandboxError::Io(err)) if force && err.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+      Err(err) => Err(err),
+    };
+  }
+
+  match unlinkat(parent_fd, leaf, 0) {
+    Ok(()) => return Ok(()),
+    Err(SandboxError::Io(err)) if force && err.raw_os_error() == Some(libc::ENOENT) => {
+      return Ok(());
+    }
+    Err(SandboxError::Io(err))
+      if matches!(err.raw_os_error(), Some(libc::EISDIR) | Some(libc::EPERM)) => {}
+    Err(err) => return Err(err),
+  }
+
+  let child_dir_fd = openat2_fd(
+    parent_fd,
+    leaf,
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    0,
+    resolve_flags,
+  )?;
+  remove_dir_contents(child_dir_fd.as_raw_fd(), force, resolve_flags)?;
+
+  match unlinkat(parent_fd, leaf, libc::AT_REMOVEDIR) {
+    Ok(()) => Ok(()),
+    Err(SandboxError::Io(err)) if force && err.raw_os_error() == Some(libc::ENOENT) => Ok(()),
+    Err(err) => Err(err),
+  }
+}
+
+fn remove_dir_contents(dir_fd: RawFd, force: bool, resolve_flags: u64) -> Result<(), SandboxError> {
+  let iter_fd = dup_fd(dir_fd)?;
+  let raw_fd = iter_fd.into_raw_fd();
+  let dir_ptr = unsafe { libc::fdopendir(raw_fd) };
+  if dir_ptr.is_null() {
+    let _ = unsafe { libc::close(raw_fd) };
+    return Err(SandboxError::Io(io::Error::last_os_error()));
+  }
+
+  loop {
+    unsafe {
+      *libc::__errno_location() = 0;
+    }
+    let entry = unsafe { libc::readdir(dir_ptr) };
+    if entry.is_null() {
+      let errno = io::Error::last_os_error();
+      let closed = unsafe { libc::closedir(dir_ptr) };
+      if closed < 0 {
+        return Err(SandboxError::Io(io::Error::last_os_error()));
+      }
+      if errno.raw_os_error() == Some(0) {
+        return Ok(());
+      }
+      return Err(SandboxError::Io(errno));
+    }
+
+    let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+    if name.to_bytes() == b"." || name.to_bytes() == b".." {
+      continue;
+    }
+    let c_name = CString::new(name.to_bytes())
+      .map_err(|_| SandboxError::InvalidPath("directory entry contains NUL byte".to_string()))?;
+
+    match unlinkat(dir_fd, &c_name, 0) {
+      Ok(()) => continue,
+      Err(SandboxError::Io(err)) if force && err.raw_os_error() == Some(libc::ENOENT) => {
+        continue;
+      }
+      Err(SandboxError::Io(err))
+        if matches!(err.raw_os_error(), Some(libc::EISDIR) | Some(libc::EPERM)) => {}
+      Err(err) => {
+        let _ = unsafe { libc::closedir(dir_ptr) };
+        return Err(err);
+      }
+    }
+
+    let child_dir_fd = match openat2_fd(
+      dir_fd,
+      &c_name,
+      libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+      0,
+      resolve_flags,
+    ) {
+      Ok(fd) => fd,
+      Err(err) => {
+        let _ = unsafe { libc::closedir(dir_ptr) };
+        return Err(err);
+      }
+    };
+
+    if let Err(err) = remove_dir_contents(child_dir_fd.as_raw_fd(), force, resolve_flags) {
+      let _ = unsafe { libc::closedir(dir_ptr) };
+      return Err(err);
+    }
+
+    if let Err(err) = unlinkat(dir_fd, &c_name, libc::AT_REMOVEDIR) {
+      let _ = unsafe { libc::closedir(dir_ptr) };
+      return Err(err);
+    }
+  }
+}
+
 fn ns_to_timespec(ns: i64) -> libc::timespec {
   let sec = ns.div_euclid(1_000_000_000);
   let nsec = ns.rem_euclid(1_000_000_000);
@@ -528,5 +695,48 @@ mod tests {
 
     let value = fs::read(root.path().join("b.txt")).unwrap();
     assert_eq!(&value, b"abc");
+  }
+
+  #[test]
+  fn link_stays_inside_root() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("a.txt"), b"x").unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    sandbox.link("a.txt", "b.txt").unwrap();
+
+    assert_eq!(fs::read(root.path().join("a.txt")).unwrap(), b"x");
+    assert_eq!(fs::read(root.path().join("b.txt")).unwrap(), b"x");
+  }
+
+  #[test]
+  fn remove_recursive_removes_tree() {
+    let root = tempdir().unwrap();
+    fs::create_dir_all(root.path().join("d1/d2")).unwrap();
+    fs::write(root.path().join("d1/d2/f.txt"), b"x").unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    sandbox.remove("d1", true, false).unwrap();
+
+    assert!(!root.path().join("d1").exists());
+  }
+
+  #[test]
+  fn remove_recursive_does_not_follow_symlink() {
+    let root = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    fs::create_dir_all(root.path().join("d1")).unwrap();
+    fs::write(outside.path().join("secret.txt"), b"secret").unwrap();
+    std::os::unix::fs::symlink(
+      outside.path(),
+      root.path().join("d1/outside-link"),
+    )
+    .unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    sandbox.remove("d1", true, false).unwrap();
+
+    assert!(outside.path().join("secret.txt").exists());
+    assert!(!root.path().join("d1").exists());
   }
 }

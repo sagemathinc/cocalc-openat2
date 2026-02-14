@@ -25,9 +25,11 @@ export declare class SandboxRoot {
   rmdir(path: string): void
   rename(oldPath: string, newPath: string): void
   renameNoReplace(oldPath: string, newPath: string): void
+  link(oldPath: string, newPath: string): void
   chmod(path: string, mode: number): void
   truncate(path: string, len: number): void
   copyFile(src: string, dest: string, mode?: number | undefined | null): void
+  rm(path: string, recursive?: boolean | undefined | null, force?: boolean | undefined | null): void
   utimes(path: string, atimeNs: number, mtimeNs: number): void
   stat(path: string): StatResult
 }

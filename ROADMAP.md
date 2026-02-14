@@ -20,6 +20,7 @@ Primary candidates to migrate first:
 8. `utimes`
 9. `truncate`
 10. `rm`
+11. `link`
 
 ## Milestones
 
@@ -29,6 +30,7 @@ Primary candidates to migrate first:
 - [x] root dirfd anchor object (`SandboxRoot`)
 - [x] `openat2` wrapper with strict resolve flags
 - [x] mutator subset (`mkdir`, `unlink`, `rmdir`, `rename`)
+- [x] additional mutators (`renameNoReplace`, `link`, recursive `rm`)
 - [x] metadata subset (`chmod`, `utimes`, `stat`)
 - [x] rust tests covering traversal/symlink escape regression
 

@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2021"
 description = "Linux openat2-based sandbox filesystem primitives for Node.js via napi-rs"
 license = "MIT"
-license-file = "LICENSE"
 repository = "https://github.com/sagemathinc/cocalc-openat2"
 
 [lib]

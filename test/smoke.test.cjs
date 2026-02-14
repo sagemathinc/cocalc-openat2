@@ -29,6 +29,9 @@ test('basic mkdir/rename/unlink/stat', () => {
     const stat = sandbox.stat('a/b/file2.txt');
     assert.equal(stat.size, 5);
 
+    sandbox.link('a/b/file2.txt', 'a/b/hard.txt');
+    assert.equal(fs.readFileSync(path.join(dir, 'a/b/hard.txt'), 'utf8'), 'hello');
+
     sandbox.unlink('a/b/file2.txt');
     assert.equal(fs.existsSync(path.join(dir, 'a/b/file2.txt')), false);
   });
@@ -57,6 +60,26 @@ test('symlink escape is denied', () => {
       const sandbox = new SandboxRoot(dir);
 
       assert.throws(() => sandbox.stat('escape-link'), /ELOOP|outside|Invalid/);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
+test('rm recursive removes tree without escaping symlink targets', () => {
+  withTempDir((dir) => {
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'openat2-outside-rm-'));
+    try {
+      fs.mkdirSync(path.join(dir, 'tree', 'nested'), { recursive: true });
+      fs.writeFileSync(path.join(dir, 'tree', 'nested', 'x.txt'), 'x');
+      fs.writeFileSync(path.join(outside, 'secret.txt'), 'secret');
+      fs.symlinkSync(path.join(outside), path.join(dir, 'tree', 'outside-link'));
+
+      const sandbox = new SandboxRoot(dir);
+      sandbox.rm('tree', true, false);
+
+      assert.equal(fs.existsSync(path.join(dir, 'tree')), false);
+      assert.equal(fs.readFileSync(path.join(outside, 'secret.txt'), 'utf8'), 'secret');
     } finally {
       fs.rmSync(outside, { recursive: true, force: true });
     }

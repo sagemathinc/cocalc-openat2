@@ -92,6 +92,11 @@ impl SandboxRoot {
   }
 
   #[napi]
+  pub fn link(&self, old_path: String, new_path: String) -> Result<()> {
+    self.inner.link(&old_path, &new_path).map_err(map_error)
+  }
+
+  #[napi]
   pub fn chmod(&self, path: String, mode: u32) -> Result<()> {
     self.inner.chmod(&path, mode).map_err(map_error)
   }
@@ -106,6 +111,14 @@ impl SandboxRoot {
     self
       .inner
       .copy_file(&src, &dest, mode.unwrap_or(0o644))
+      .map_err(map_error)
+  }
+
+  #[napi]
+  pub fn rm(&self, path: String, recursive: Option<bool>, force: Option<bool>) -> Result<()> {
+    self
+      .inner
+      .remove(&path, recursive.unwrap_or(false), force.unwrap_or(false))
       .map_err(map_error)
   }
 
@@ -142,6 +155,8 @@ fn errno_to_code(errno: i32) -> &'static str {
     libc::EISDIR => "EISDIR",
     libc::EINVAL => "EINVAL",
     libc::EEXIST => "EEXIST",
+    libc::ENOTEMPTY => "ENOTEMPTY",
+    libc::EBUSY => "EBUSY",
     libc::ENOSYS => "ENOSYS",
     libc::EXDEV => "EXDEV",
     libc::ELOOP => "ELOOP",
