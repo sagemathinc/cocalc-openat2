@@ -97,6 +97,11 @@ impl SandboxRoot {
   }
 
   #[napi]
+  pub fn symlink(&self, target: String, new_path: String) -> Result<()> {
+    self.inner.symlink(&target, &new_path).map_err(map_error)
+  }
+
+  #[napi]
   pub fn chmod(&self, path: String, mode: u32) -> Result<()> {
     self.inner.chmod(&path, mode).map_err(map_error)
   }

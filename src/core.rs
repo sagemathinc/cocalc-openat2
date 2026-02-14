@@ -201,6 +201,20 @@ impl Sandbox {
     Ok(())
   }
 
+  pub fn symlink(&self, target: &str, new_path: &str) -> Result<(), SandboxError> {
+    let new_components = normalize_relative_components(new_path)?;
+    let (new_parent, new_leaf) = split_parent_leaf(&new_components)?;
+    let new_parent_fd = self.open_dir_from_root_readable(new_parent.as_path())?;
+    let c_target = CString::new(target.as_bytes())
+      .map_err(|_| SandboxError::InvalidPath("symlink target contains NUL byte".to_string()))?;
+
+    let rc = unsafe { libc::symlinkat(c_target.as_ptr(), new_parent_fd.as_raw_fd(), new_leaf.as_ptr()) };
+    if rc < 0 {
+      return Err(SandboxError::Io(io::Error::last_os_error()));
+    }
+    Ok(())
+  }
+
   pub fn remove(&self, path: &str, recursive: bool, force: bool) -> Result<(), SandboxError> {
     let components = normalize_relative_components(path)?;
     let (parent, leaf) = split_parent_leaf(&components)?;
@@ -707,6 +721,18 @@ mod tests {
 
     assert_eq!(fs::read(root.path().join("a.txt")).unwrap(), b"x");
     assert_eq!(fs::read(root.path().join("b.txt")).unwrap(), b"x");
+  }
+
+  #[test]
+  fn symlink_creates_link() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("a.txt"), b"x").unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    sandbox.symlink("a.txt", "s.txt").unwrap();
+
+    let link_target = fs::read_link(root.path().join("s.txt")).unwrap();
+    assert_eq!(link_target, PathBuf::from("a.txt"));
   }
 
   #[test]

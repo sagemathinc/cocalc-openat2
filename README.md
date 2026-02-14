@@ -64,6 +64,7 @@ Methods implemented now:
 - `rename(oldPath, newPath)`
 - `renameNoReplace(oldPath, newPath)`
 - `link(oldPath, newPath)`
+- `symlink(target, newPath)`
 - `chmod(path, mode)`
 - `truncate(path, len)`
 - `copyFile(src, dest, mode?)`

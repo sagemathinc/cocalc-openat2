@@ -31,6 +31,8 @@ test('basic mkdir/rename/unlink/stat', () => {
 
     sandbox.link('a/b/file2.txt', 'a/b/hard.txt');
     assert.equal(fs.readFileSync(path.join(dir, 'a/b/hard.txt'), 'utf8'), 'hello');
+    sandbox.symlink('hard.txt', 'a/b/sym.txt');
+    assert.equal(fs.readFileSync(path.join(dir, 'a/b/sym.txt'), 'utf8'), 'hello');
 
     sandbox.unlink('a/b/file2.txt');
     assert.equal(fs.existsSync(path.join(dir, 'a/b/file2.txt')), false);

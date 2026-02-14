@@ -26,6 +26,7 @@ export declare class SandboxRoot {
   rename(oldPath: string, newPath: string): void
   renameNoReplace(oldPath: string, newPath: string): void
   link(oldPath: string, newPath: string): void
+  symlink(target: string, newPath: string): void
   chmod(path: string, mode: number): void
   truncate(path: string, len: number): void
   copyFile(src: string, dest: string, mode?: number | undefined | null): void
