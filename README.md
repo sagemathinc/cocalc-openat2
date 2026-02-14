@@ -4,9 +4,45 @@ Linux-only `napi-rs` addon that exposes `openat2`-anchored filesystem operations
 
 ## Why this exists
 
-`path -> validate -> mutate(path)` is vulnerable to TOCTOU races if a path component is swapped between validation and the operation.
+In CoCalc safe mode, we need a strong guarantee:
 
-This package keeps all sensitive path resolution inside kernel-checked `openat2(..., RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)` flows and performs mutations via `*at` syscalls on validated dirfds.
+- filesystem operations for a project stay inside that project root
+- even if the project owner (or another process) is changing paths concurrently
+
+The subtle failure mode is a classic race:
+
+1. We validate a string path (e.g. `a/b/file.txt`) and it looks safe.
+2. Before the actual mutation syscall runs, an attacker swaps an intermediate path component (or leaf) to a symlink.
+3. The mutation then lands outside the sandbox.
+
+That `validate(path) -> mutate(path)` pattern is fundamentally fragile under concurrency, because validation and mutation happen at different times on a mutable namespace.
+
+`openat2` changes the model from string-based trust to descriptor-based trust:
+
+- we first open a **root directory handle** (`dirfd`) for the sandbox root
+- each operation resolves relative paths under that root via `openat2`
+- kernel-enforced resolve rules (`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`) prevent escaping during resolution
+- we then mutate via `*at` syscalls (`mkdirat`, `renameat`, `unlinkat`, etc.) anchored to validated dirfds
+
+This is closer to a capability model: possession of the root `dirfd` defines the authority boundary, and every derived operation stays constrained to that boundary. In practice, this removes dependence on ad-hoc deny/allow path filtering as the primary safety mechanism.
+
+Why not just use Node `fs` + file descriptors?
+
+- File descriptors help for **existing-file content I/O** (`read`/`write` on an already opened inode), and we do use that pattern.
+- But many dangerous operations are **path mutators** (`mkdir`, `rename`, `unlink`, `rmdir`, `chmod`, `utimes`, create paths) that still require pathname resolution at operation time.
+- In plain Node, those mutators are path-based. You can pre-check with `realpath`/`lstat`, but that is still a user-space check followed by a later path syscall, so there is still a race window.
+- For create flows, there may be no target inode yet to pin with an fd. The critical security question is whether parent-chain resolution stayed inside the sandbox at the exact syscall boundary.
+- Node does not currently expose a complete `openat2`/`*at` capability API that lets us anchor all resolution to a sandbox dirfd with kernel-enforced constraints.
+
+So fd-only hardening in Node is necessary but not sufficient: it meaningfully improves read/write safety, but it cannot fully eliminate TOCTOU escape classes for path-mutating operations. `openat2` + `*at` is the piece that closes that remaining gap.
+
+Tradeoffs:
+
+- implementation is more tedious than plain Node `fs` path calls
+- Linux-specific (`openat2` is a Linux syscall)
+- existing path-oriented code needs adapter layers for migration
+
+For our situation, that tradeoff is worth it: mutators become fail-closed under symlink/path-swap races, which is exactly the remaining hardening gap in backend sandbox safe mode.
 
 ## Current API
 

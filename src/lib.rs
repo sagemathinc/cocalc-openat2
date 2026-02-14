@@ -84,6 +84,14 @@ impl SandboxRoot {
   }
 
   #[napi]
+  pub fn rename_no_replace(&self, old_path: String, new_path: String) -> Result<()> {
+    self
+      .inner
+      .rename_noreplace(&old_path, &new_path)
+      .map_err(map_error)
+  }
+
+  #[napi]
   pub fn chmod(&self, path: String, mode: u32) -> Result<()> {
     self.inner.chmod(&path, mode).map_err(map_error)
   }

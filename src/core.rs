@@ -151,6 +151,31 @@ impl Sandbox {
     Ok(())
   }
 
+  pub fn rename_noreplace(&self, old_path: &str, new_path: &str) -> Result<(), SandboxError> {
+    let old_components = normalize_relative_components(old_path)?;
+    let new_components = normalize_relative_components(new_path)?;
+
+    let (old_parent, old_leaf) = split_parent_leaf(&old_components)?;
+    let (new_parent, new_leaf) = split_parent_leaf(&new_components)?;
+
+    let old_parent_fd = self.open_dir_from_root(old_parent.as_path())?;
+    let new_parent_fd = self.open_dir_from_root(new_parent.as_path())?;
+
+    let rc = unsafe {
+      libc::renameat2(
+        old_parent_fd.as_raw_fd(),
+        old_leaf.as_ptr(),
+        new_parent_fd.as_raw_fd(),
+        new_leaf.as_ptr(),
+        libc::RENAME_NOREPLACE,
+      )
+    };
+    if rc < 0 {
+      return Err(SandboxError::Io(io::Error::last_os_error()));
+    }
+    Ok(())
+  }
+
   pub fn chmod(&self, path: &str, mode: u32) -> Result<(), SandboxError> {
     let fd = self.open_existing(path, libc::O_RDONLY)?;
     let rc = unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) };
@@ -476,6 +501,20 @@ mod tests {
 
     assert!(!root.path().join("a.txt").exists());
     assert!(root.path().join("b.txt").exists());
+  }
+
+  #[test]
+  fn rename_noreplace_returns_eexist_when_destination_exists() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("a.txt"), b"x").unwrap();
+    fs::write(root.path().join("b.txt"), b"y").unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    let err = sandbox.rename_noreplace("a.txt", "b.txt").unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EEXIST));
+
+    assert_eq!(fs::read(root.path().join("a.txt")).unwrap(), b"x");
+    assert_eq!(fs::read(root.path().join("b.txt")).unwrap(), b"y");
   }
 
   #[test]

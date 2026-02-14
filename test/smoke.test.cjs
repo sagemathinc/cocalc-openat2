@@ -34,6 +34,20 @@ test('basic mkdir/rename/unlink/stat', () => {
   });
 });
 
+test('renameNoReplace preserves destination and returns EEXIST', () => {
+  withTempDir((dir) => {
+    const sandbox = new SandboxRoot(dir);
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'a');
+    fs.writeFileSync(path.join(dir, 'b.txt'), 'b');
+    assert.throws(
+      () => sandbox.renameNoReplace('a.txt', 'b.txt'),
+      /EEXIST/,
+    );
+    assert.equal(fs.readFileSync(path.join(dir, 'a.txt'), 'utf8'), 'a');
+    assert.equal(fs.readFileSync(path.join(dir, 'b.txt'), 'utf8'), 'b');
+  });
+});
+
 test('symlink escape is denied', () => {
   withTempDir((dir) => {
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'openat2-outside-'));
