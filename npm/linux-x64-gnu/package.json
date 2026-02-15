@@ -1,0 +1,22 @@
+{
+  "name": "@cocalc/openat2-linux-x64-gnu",
+  "version": "0.1.0",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "cocalc_openat2.linux-x64-gnu.node",
+  "files": [
+    "cocalc_openat2.linux-x64-gnu.node"
+  ],
+  "description": "Linux openat2-based filesystem primitives for secure sandboxing",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "libc": [
+    "glibc"
+  ]
+}

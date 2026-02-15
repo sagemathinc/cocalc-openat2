@@ -105,14 +105,31 @@ pnpm run test:rust
 
 ## Packaging notes
 
-This repository is prepared for `napi-rs` prebuilds for:
+This repository is configured to publish Linux prebuilt binaries for:
 
 - `x86_64-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`
 
-## Planned next steps
+Runtime loading prefers:
 
-1. Add `openRead`/`openWrite` fd-returning APIs for efficient file-content paths.
-2. Add `copyFile` (`copy_file_range`/fallback) and recursive remove helpers.
-3. Add deterministic Node integration tests reproducing symlink-swap races.
-4. Integrate into CoCalc backend sandbox safe mode behind a feature flag.
+1. local `cocalc_openat2.linux-*.node` files (for CI/dev artifacts)
+2. optional npm packages (`@cocalc/openat2-linux-x64-gnu` / `@cocalc/openat2-linux-arm64-gnu`)
+3. local `cocalc_openat2.node` fallback for local development
+
+### Release automation
+
+The workflow in [.github/workflows/release.yml](./.github/workflows/release.yml):
+
+1. builds both linux targets
+2. uploads `.node` artifacts
+3. on `v*` tags, downloads artifacts and publishes:
+   - `@cocalc/openat2-linux-x64-gnu`
+   - `@cocalc/openat2-linux-arm64-gnu`
+   - `@cocalc/openat2` (root package)
+
+Publishing relies on the root `prepublishOnly` script:
+
+```bash
+pnpm run create-npm-dirs
+napi prepublish -t npm --tagstyle npm --skip-gh-release
+```

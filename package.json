@@ -10,16 +10,21 @@
     "index.js",
     "index.d.ts",
     "LICENSE",
-    "*.node"
+    "README.md"
   ],
   "scripts": {
-    "build": "napi build --release",
-    "build:debug": "napi build",
+    "artifacts": "napi artifacts -d artifacts",
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
     "build:platform": "napi build --platform --release",
+    "build:target": "napi build --platform --release --target",
+    "create-npm-dirs": "napi create-npm-dir -t .",
+    "prepublishOnly": "pnpm run create-npm-dirs && napi prepublish -t npm --tagstyle npm --skip-gh-release",
     "test:node": "node --test test/*.test.cjs",
     "test:rust": "cargo test",
     "test": "pnpm run test:rust && pnpm run test:node",
-    "lint:rust": "cargo clippy --all-targets --all-features -- -D warnings"
+    "lint:rust": "cargo clippy --all-targets --all-features -- -D warnings",
+    "version": "napi version"
   },
   "engines": {
     "node": ">=18"
@@ -36,5 +41,9 @@
         "aarch64-unknown-linux-gnu"
       ]
     }
+  },
+  "optionalDependencies": {
+    "@cocalc/openat2-linux-x64-gnu": "0.1.0",
+    "@cocalc/openat2-linux-arm64-gnu": "0.1.0"
   }
 }

@@ -682,12 +682,12 @@ fn stat_from_libc(st: &libc::stat) -> FileStat {
     uid: st.st_uid,
     gid: st.st_gid,
     rdev: st.st_rdev as u64,
-    size: st.st_size,
-    blksize: st.st_blksize,
-    blocks: st.st_blocks,
-    atime_ns: st.st_atime.saturating_mul(1_000_000_000) + st.st_atime_nsec,
-    mtime_ns: st.st_mtime.saturating_mul(1_000_000_000) + st.st_mtime_nsec,
-    ctime_ns: st.st_ctime.saturating_mul(1_000_000_000) + st.st_ctime_nsec,
+    size: st.st_size as i64,
+    blksize: st.st_blksize as i64,
+    blocks: st.st_blocks as i64,
+    atime_ns: (st.st_atime as i64).saturating_mul(1_000_000_000) + st.st_atime_nsec as i64,
+    mtime_ns: (st.st_mtime as i64).saturating_mul(1_000_000_000) + st.st_mtime_nsec as i64,
+    ctime_ns: (st.st_ctime as i64).saturating_mul(1_000_000_000) + st.st_ctime_nsec as i64,
   }
 }
 
