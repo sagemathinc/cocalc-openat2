@@ -1,6 +1,6 @@
 {
   "name": "@cocalc/openat2",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Linux openat2-based filesystem primitives for secure sandboxing",
   "license": "MIT",
   "type": "commonjs",
