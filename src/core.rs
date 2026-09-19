@@ -265,6 +265,63 @@ impl Sandbox {
     Ok(())
   }
 
+  pub fn copy_file_noreplace(&self, src: &str, dest: &str) -> Result<(), SandboxError> {
+    let src_fd = self.open_existing(src, libc::O_RDONLY)?;
+    let mut src_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let stat_rc = unsafe { libc::fstat(src_fd.as_raw_fd(), src_stat.as_mut_ptr()) };
+    if stat_rc < 0 {
+      return Err(SandboxError::Io(io::Error::last_os_error()));
+    }
+    let src_stat = unsafe { src_stat.assume_init() };
+
+    let dest_components = normalize_relative_components(dest)?;
+    let (dest_parent, dest_leaf) = split_parent_leaf(&dest_components)?;
+    let dest_parent_fd = self.open_dir_from_root(dest_parent.as_path())?;
+    let dot = CString::new(".").expect("static string has no NUL byte");
+    let temp_fd = unsafe {
+      libc::openat(
+        dest_parent_fd.as_raw_fd(),
+        dot.as_ptr(),
+        libc::O_TMPFILE | libc::O_WRONLY | libc::O_CLOEXEC,
+        (src_stat.st_mode & 0o7777) as libc::mode_t,
+      )
+    };
+    if temp_fd < 0 {
+      return Err(SandboxError::Io(io::Error::last_os_error()));
+    }
+
+    let mut src_file: File = src_fd.into();
+    let mut temp_file = unsafe { File::from_raw_fd(temp_fd) };
+    std::io::copy(&mut src_file, &mut temp_file)?;
+    temp_file.flush()?;
+
+    let chmod_rc = unsafe {
+      libc::fchmod(
+        temp_file.as_raw_fd(),
+        (src_stat.st_mode & 0o7777) as libc::mode_t,
+      )
+    };
+    if chmod_rc < 0 {
+      return Err(SandboxError::Io(io::Error::last_os_error()));
+    }
+
+    let empty = CString::new("").expect("static string has no NUL byte");
+    let link_rc = unsafe {
+      libc::linkat(
+        temp_file.as_raw_fd(),
+        empty.as_ptr(),
+        dest_parent_fd.as_raw_fd(),
+        dest_leaf.as_ptr(),
+        libc::AT_EMPTY_PATH,
+      )
+    };
+    if link_rc < 0 {
+      return Err(SandboxError::Io(io::Error::last_os_error()));
+    }
+
+    Ok(())
+  }
+
   pub fn open_read_fd(&self, path: &str) -> Result<RawFd, SandboxError> {
     let fd = self.open_existing(path, libc::O_RDONLY)?;
     Ok(fd.into_raw_fd())
@@ -757,6 +814,94 @@ mod tests {
 
     let value = fs::read(root.path().join("b.txt")).unwrap();
     assert_eq!(&value, b"abc");
+  }
+
+  #[test]
+  fn copy_file_noreplace_creates_destination() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("a.txt"), b"abcdef").unwrap();
+    let mut permissions = fs::metadata(root.path().join("a.txt"))
+      .unwrap()
+      .permissions();
+    use std::os::unix::fs::PermissionsExt;
+    permissions.set_mode(0o751);
+    fs::set_permissions(root.path().join("a.txt"), permissions).unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    sandbox.copy_file_noreplace("a.txt", "b.txt").unwrap();
+
+    assert_eq!(fs::read(root.path().join("b.txt")).unwrap(), b"abcdef");
+    assert_eq!(
+      fs::metadata(root.path().join("b.txt"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o7777,
+      0o751
+    );
+  }
+
+  #[test]
+  fn copy_file_noreplace_preserves_existing_destination() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("a.txt"), b"new").unwrap();
+    fs::write(root.path().join("b.txt"), b"existing").unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    let err = sandbox.copy_file_noreplace("a.txt", "b.txt").unwrap_err();
+
+    assert_eq!(err.raw_os_error(), Some(libc::EEXIST));
+    assert_eq!(fs::read(root.path().join("b.txt")).unwrap(), b"existing");
+  }
+
+  #[test]
+  fn concurrent_copy_file_noreplace_has_one_complete_winner() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let root = tempdir().unwrap();
+    let first = vec![b'a'; 2 * 1024 * 1024];
+    let second = vec![b'b'; 2 * 1024 * 1024];
+    fs::write(root.path().join("a.txt"), &first).unwrap();
+    fs::write(root.path().join("b.txt"), &second).unwrap();
+
+    let root_path = root.path().to_str().unwrap().to_string();
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = ["a.txt", "b.txt"]
+      .into_iter()
+      .map(|source| {
+        let root_path = root_path.clone();
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+          let sandbox = Sandbox::new(&root_path).unwrap();
+          barrier.wait();
+          sandbox.copy_file_noreplace(source, "destination.txt")
+        })
+      })
+      .collect();
+
+    let results: Vec<_> = handles
+      .into_iter()
+      .map(|handle| handle.join().unwrap())
+      .collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+      results
+        .iter()
+        .filter(|result| {
+          result
+            .as_ref()
+            .err()
+            .and_then(SandboxError::raw_os_error)
+            == Some(libc::EEXIST)
+        })
+        .count(),
+      1
+    );
+
+    let destination = fs::read(root.path().join("destination.txt")).unwrap();
+    assert!(destination == first || destination == second);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 3);
   }
 
   #[test]

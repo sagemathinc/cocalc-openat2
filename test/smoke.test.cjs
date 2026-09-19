@@ -80,6 +80,33 @@ test('renameNoReplace preserves destination and returns EEXIST', () => {
   });
 });
 
+test('copyFileNoReplace publishes only a complete new destination', () => {
+  withTempDir((dir) => {
+    const sandbox = new SandboxRoot(dir);
+    fs.writeFileSync(path.join(dir, 'source.txt'), 'new');
+
+    sandbox.copyFileNoReplace('source.txt', 'destination.txt');
+    assert.equal(
+      fs.readFileSync(path.join(dir, 'destination.txt'), 'utf8'),
+      'new',
+    );
+
+    fs.writeFileSync(path.join(dir, 'source.txt'), 'replacement');
+    assert.throws(
+      () => sandbox.copyFileNoReplace('source.txt', 'destination.txt'),
+      /EEXIST/,
+    );
+    assert.equal(
+      fs.readFileSync(path.join(dir, 'destination.txt'), 'utf8'),
+      'new',
+    );
+    assert.deepEqual(
+      fs.readdirSync(dir).sort(),
+      ['destination.txt', 'source.txt'],
+    );
+  });
+});
+
 test('symlink escape is denied', () => {
   withTempDir((dir) => {
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'openat2-outside-'));

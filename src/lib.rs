@@ -120,6 +120,14 @@ impl SandboxRoot {
   }
 
   #[napi]
+  pub fn copy_file_no_replace(&self, src: String, dest: String) -> Result<()> {
+    self
+      .inner
+      .copy_file_noreplace(&src, &dest)
+      .map_err(map_error)
+  }
+
+  #[napi]
   pub fn open_read(&self, path: String) -> Result<i32> {
     self
       .inner
@@ -196,6 +204,7 @@ fn errno_to_code(errno: i32) -> &'static str {
     libc::ENOSYS => "ENOSYS",
     libc::EXDEV => "EXDEV",
     libc::ELOOP => "ELOOP",
+    libc::EOPNOTSUPP => "ENOTSUP",
     _ => "EIO",
   }
 }

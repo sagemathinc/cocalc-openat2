@@ -68,6 +68,7 @@ Methods implemented now:
 - `chmod(path, mode)`
 - `truncate(path, len)`
 - `copyFile(src, dest, mode?)`
+- `copyFileNoReplace(src, dest)`
 - `rm(path, recursive?, force?)`
 - `utimes(path, atimeNs, mtimeNs)`
 - `stat(path)`
@@ -76,6 +77,10 @@ Methods implemented now:
 
 `openRead`/`openWrite` return numeric file descriptors intended for high-frequency
 I/O paths in Node. The caller owns the descriptor and must close it.
+
+`copyFileNoReplace` copies into an unnamed file in the destination directory,
+then publishes it atomically only if the destination does not exist. It requires
+filesystem support for Linux `O_TMPFILE` and otherwise returns `ENOTSUP`.
 
 ## Security model
 

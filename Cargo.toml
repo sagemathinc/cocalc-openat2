@@ -1,6 +1,6 @@
 [package]
 name = "cocalc-openat2"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Linux openat2-based sandbox filesystem primitives for Node.js via napi-rs"
 license = "MIT"
