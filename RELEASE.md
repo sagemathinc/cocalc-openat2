@@ -39,6 +39,7 @@ pnpm run create-npm-dirs
 
 pnpm exec napi build --platform --release --target x86_64-unknown-linux-gnu
 CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
   pnpm exec napi build --platform --release --target aarch64-unknown-linux-gnu
 
 cp cocalc_openat2.linux-x64-gnu.node npm/linux-x64-gnu/
