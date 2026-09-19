@@ -59,6 +59,7 @@ jobs:
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
               pnpm exec napi build --platform --release --target ${{ matrix.target }}
           else
             pnpm exec napi build --platform --release --target ${{ matrix.target }}
