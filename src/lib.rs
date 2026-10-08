@@ -6,7 +6,8 @@ compile_error!("@cocalc/openat2 currently only supports Linux");
 mod core;
 
 use core::{FileStat, Sandbox, SandboxError};
-use napi::{Error, Result, Status};
+use napi::bindgen_prelude::AsyncTask;
+use napi::{Env, Error, Result, Status, Task};
 use napi_derive::napi;
 
 #[napi(object)]
@@ -49,6 +50,59 @@ impl From<FileStat> for StatResult {
 #[napi]
 pub struct SandboxRoot {
   inner: Sandbox,
+}
+
+#[derive(Clone, Copy)]
+enum CopyMode {
+  Replace { mode: u32 },
+  NoReplace,
+}
+
+pub struct CopyFileTask {
+  sandbox: Sandbox,
+  src: String,
+  dest: String,
+  mode: CopyMode,
+}
+
+impl Task for CopyFileTask {
+  type Output = ();
+  type JsValue = ();
+
+  fn compute(&mut self) -> Result<Self::Output> {
+    match self.mode {
+      CopyMode::Replace { mode } => self.sandbox.copy_file(&self.src, &self.dest, mode),
+      CopyMode::NoReplace => self.sandbox.copy_file_noreplace(&self.src, &self.dest),
+    }
+    .map_err(map_error)
+  }
+
+  fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
+    Ok(())
+  }
+}
+
+pub struct RemoveTask {
+  sandbox: Sandbox,
+  path: String,
+  recursive: bool,
+  force: bool,
+}
+
+impl Task for RemoveTask {
+  type Output = ();
+  type JsValue = ();
+
+  fn compute(&mut self) -> Result<Self::Output> {
+    self
+      .sandbox
+      .remove(&self.path, self.recursive, self.force)
+      .map_err(map_error)
+  }
+
+  fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
+    Ok(())
+  }
 }
 
 #[napi]
@@ -111,20 +165,31 @@ impl SandboxRoot {
     self.inner.truncate(&path, len).map_err(map_error)
   }
 
-  #[napi]
-  pub fn copy_file(&self, src: String, dest: String, mode: Option<u32>) -> Result<()> {
-    self
-      .inner
-      .copy_file(&src, &dest, mode.unwrap_or(0o644))
-      .map_err(map_error)
+  #[napi(ts_return_type = "Promise<void>")]
+  pub fn copy_file(
+    &self,
+    src: String,
+    dest: String,
+    mode: Option<u32>,
+  ) -> Result<AsyncTask<CopyFileTask>> {
+    Ok(AsyncTask::new(CopyFileTask {
+      sandbox: self.inner.try_clone().map_err(map_error)?,
+      src,
+      dest,
+      mode: CopyMode::Replace {
+        mode: mode.unwrap_or(0o644),
+      },
+    }))
   }
 
-  #[napi]
-  pub fn copy_file_no_replace(&self, src: String, dest: String) -> Result<()> {
-    self
-      .inner
-      .copy_file_noreplace(&src, &dest)
-      .map_err(map_error)
+  #[napi(ts_return_type = "Promise<void>")]
+  pub fn copy_file_no_replace(&self, src: String, dest: String) -> Result<AsyncTask<CopyFileTask>> {
+    Ok(AsyncTask::new(CopyFileTask {
+      sandbox: self.inner.try_clone().map_err(map_error)?,
+      src,
+      dest,
+      mode: CopyMode::NoReplace,
+    }))
   }
 
   #[napi]
@@ -158,12 +223,19 @@ impl SandboxRoot {
       .map_err(map_error)
   }
 
-  #[napi]
-  pub fn rm(&self, path: String, recursive: Option<bool>, force: Option<bool>) -> Result<()> {
-    self
-      .inner
-      .remove(&path, recursive.unwrap_or(false), force.unwrap_or(false))
-      .map_err(map_error)
+  #[napi(ts_return_type = "Promise<void>")]
+  pub fn rm(
+    &self,
+    path: String,
+    recursive: Option<bool>,
+    force: Option<bool>,
+  ) -> Result<AsyncTask<RemoveTask>> {
+    Ok(AsyncTask::new(RemoveTask {
+      sandbox: self.inner.try_clone().map_err(map_error)?,
+      path,
+      recursive: recursive.unwrap_or(false),
+      force: force.unwrap_or(false),
+    }))
   }
 
   #[napi]

@@ -67,9 +67,9 @@ Methods implemented now:
 - `symlink(target, newPath)`
 - `chmod(path, mode)`
 - `truncate(path, len)`
-- `copyFile(src, dest, mode?)`
-- `copyFileNoReplace(src, dest)`
-- `rm(path, recursive?, force?)`
+- `copyFile(src, dest, mode?) -> Promise<void>`
+- `copyFileNoReplace(src, dest) -> Promise<void>`
+- `rm(path, recursive?, force?) -> Promise<void>`
 - `utimes(path, atimeNs, mtimeNs)`
 - `stat(path)`
 - `openRead(path) -> fd`
@@ -77,6 +77,10 @@ Methods implemented now:
 
 `openRead`/`openWrite` return numeric file descriptors intended for high-frequency
 I/O paths in Node. The caller owns the descriptor and must close it.
+
+Content I/O accepts regular files only. Special files such as FIFOs are rejected
+without performing a blocking open on the JavaScript main thread. Copying and
+recursive removal run on the napi-rs worker pool.
 
 `copyFileNoReplace` copies into an unnamed file in the destination directory,
 then publishes it atomically only if the destination does not exist. It requires

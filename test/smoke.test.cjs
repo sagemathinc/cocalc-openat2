@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 
 const { SandboxRoot } = require('../index.js');
 
@@ -15,13 +16,22 @@ function withTempDir(fn) {
   }
 }
 
-test('basic mkdir/rename/unlink/stat', () => {
-  withTempDir((dir) => {
+async function withTempDirAsync(fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'openat2-test-'));
+  try {
+    await fn(dir);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('basic mkdir/rename/unlink/stat', async () => {
+  await withTempDirAsync(async (dir) => {
     const sandbox = new SandboxRoot(dir);
     sandbox.mkdir('a/b', true);
     fs.writeFileSync(path.join(dir, 'a/b/file.txt'), 'hello');
 
-    sandbox.copyFile('a/b/file.txt', 'a/b/copy.txt');
+    await sandbox.copyFile('a/b/file.txt', 'a/b/copy.txt');
     sandbox.truncate('a/b/copy.txt', 2);
     assert.equal(fs.readFileSync(path.join(dir, 'a/b/copy.txt'), 'utf8'), 'he');
 
@@ -80,20 +90,20 @@ test('renameNoReplace preserves destination and returns EEXIST', () => {
   });
 });
 
-test('copyFileNoReplace publishes only a complete new destination', () => {
-  withTempDir((dir) => {
+test('copyFileNoReplace publishes only a complete new destination', async () => {
+  await withTempDirAsync(async (dir) => {
     const sandbox = new SandboxRoot(dir);
     fs.writeFileSync(path.join(dir, 'source.txt'), 'new');
 
-    sandbox.copyFileNoReplace('source.txt', 'destination.txt');
+    await sandbox.copyFileNoReplace('source.txt', 'destination.txt');
     assert.equal(
       fs.readFileSync(path.join(dir, 'destination.txt'), 'utf8'),
       'new',
     );
 
     fs.writeFileSync(path.join(dir, 'source.txt'), 'replacement');
-    assert.throws(
-      () => sandbox.copyFileNoReplace('source.txt', 'destination.txt'),
+    await assert.rejects(
+      sandbox.copyFileNoReplace('source.txt', 'destination.txt'),
       /EEXIST/,
     );
     assert.equal(
@@ -122,8 +132,8 @@ test('symlink escape is denied', () => {
   });
 });
 
-test('rm recursive removes tree without escaping symlink targets', () => {
-  withTempDir((dir) => {
+test('rm recursive removes tree without escaping symlink targets', async () => {
+  await withTempDirAsync(async (dir) => {
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'openat2-outside-rm-'));
     try {
       fs.mkdirSync(path.join(dir, 'tree', 'nested'), { recursive: true });
@@ -132,7 +142,7 @@ test('rm recursive removes tree without escaping symlink targets', () => {
       fs.symlinkSync(path.join(outside), path.join(dir, 'tree', 'outside-link'));
 
       const sandbox = new SandboxRoot(dir);
-      sandbox.rm('tree', true, false);
+      await sandbox.rm('tree', true, false);
 
       assert.equal(fs.existsSync(path.join(dir, 'tree')), false);
       assert.equal(fs.readFileSync(path.join(outside, 'secret.txt'), 'utf8'), 'secret');
@@ -140,4 +150,70 @@ test('rm recursive removes tree without escaping symlink targets', () => {
       fs.rmSync(outside, { recursive: true, force: true });
     }
   });
+});
+
+test('copyFile rejects same-inode destinations without data loss', async () => {
+  await withTempDirAsync(async (dir) => {
+    const sandbox = new SandboxRoot(dir);
+    fs.writeFileSync(path.join(dir, 'source.txt'), 'preserve me');
+    fs.linkSync(path.join(dir, 'source.txt'), path.join(dir, 'alias.txt'));
+
+    await assert.rejects(
+      sandbox.copyFile('source.txt', 'source.txt'),
+      /EINVAL/,
+    );
+    await assert.rejects(
+      sandbox.copyFile('source.txt', 'alias.txt'),
+      /EINVAL/,
+    );
+    assert.equal(fs.readFileSync(path.join(dir, 'source.txt'), 'utf8'), 'preserve me');
+    assert.equal(fs.readFileSync(path.join(dir, 'alias.txt'), 'utf8'), 'preserve me');
+  });
+});
+
+test('FIFO operations return without blocking the Node process', () => {
+  const addon = path.join(__dirname, '..', 'index.js');
+  const operations = [
+    'openRead',
+    'openWrite',
+    'chmod',
+    'truncate',
+    'utimes',
+    'copyFile',
+    'copyFileNoReplace',
+  ];
+  const script = String.raw`
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+    const { spawnSync } = require('node:child_process');
+    const { SandboxRoot } = require(process.argv[1]);
+    const operation = process.argv[2];
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'openat2-fifo-'));
+    spawnSync('mkfifo', [path.join(dir, 'fifo')], { stdio: 'inherit' });
+    const sandbox = new SandboxRoot(dir);
+    (async () => {
+      try {
+        switch (operation) {
+          case 'openRead': sandbox.openRead('fifo'); break;
+          case 'openWrite': sandbox.openWrite('fifo', false, false, false, 0o600); break;
+          case 'chmod': sandbox.chmod('fifo', 0o600); break;
+          case 'truncate': sandbox.truncate('fifo', 0); break;
+          case 'utimes': sandbox.utimes('fifo', 0, 0); break;
+          case 'copyFile': await sandbox.copyFile('fifo', 'copy'); break;
+          case 'copyFileNoReplace': await sandbox.copyFileNoReplace('fifo', 'copy'); break;
+        }
+      } catch {}
+      fs.rmSync(dir, { recursive: true, force: true });
+    })();
+  `;
+
+  for (const operation of operations) {
+    const result = spawnSync(process.execPath, ['-e', script, addon, operation], {
+      encoding: 'utf8',
+      timeout: 2_000,
+    });
+    assert.notEqual(result.error?.code, 'ETIMEDOUT', `${operation} blocked`);
+    assert.equal(result.status, 0, result.stderr);
+  }
 });

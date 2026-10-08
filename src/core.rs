@@ -87,18 +87,33 @@ impl Sandbox {
       return Err(SandboxError::Io(io::Error::last_os_error()));
     }
 
-    Ok(Self {
+    let sandbox = Self {
       root_fd: unsafe { OwnedFd::from_raw_fd(fd) },
       resolve_flags: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+    };
+
+    // Fail construction when the kernel or syscall policy does not actually
+    // support the confinement primitive this type promises.
+    let dot = CString::new(".").expect("static string has no NUL byte");
+    drop(openat2_fd(
+      sandbox.root_fd.as_raw_fd(),
+      &dot,
+      libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+      0,
+      sandbox.resolve_flags,
+    )?);
+
+    Ok(sandbox)
+  }
+
+  pub fn try_clone(&self) -> Result<Self, SandboxError> {
+    Ok(Self {
+      root_fd: dup_fd(self.root_fd.as_raw_fd())?,
+      resolve_flags: self.resolve_flags,
     })
   }
 
-  pub fn mkdir(
-    &self,
-    path: &str,
-    recursive: bool,
-    mode: u32,
-  ) -> Result<(), SandboxError> {
+  pub fn mkdir(&self, path: &str, recursive: bool, mode: u32) -> Result<(), SandboxError> {
     let components = normalize_relative_components(path)?;
     if components.is_empty() {
       return Err(SandboxError::EmptyPath);
@@ -208,7 +223,13 @@ impl Sandbox {
     let c_target = CString::new(target.as_bytes())
       .map_err(|_| SandboxError::InvalidPath("symlink target contains NUL byte".to_string()))?;
 
-    let rc = unsafe { libc::symlinkat(c_target.as_ptr(), new_parent_fd.as_raw_fd(), new_leaf.as_ptr()) };
+    let rc = unsafe {
+      libc::symlinkat(
+        c_target.as_ptr(),
+        new_parent_fd.as_raw_fd(),
+        new_leaf.as_ptr(),
+      )
+    };
     if rc < 0 {
       return Err(SandboxError::Io(io::Error::last_os_error()));
     }
@@ -229,7 +250,7 @@ impl Sandbox {
   }
 
   pub fn chmod(&self, path: &str, mode: u32) -> Result<(), SandboxError> {
-    let fd = self.open_existing(path, libc::O_RDONLY)?;
+    let fd = self.open_existing(path, libc::O_RDONLY | libc::O_NONBLOCK)?;
     let rc = unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) };
     if rc < 0 {
       return Err(SandboxError::Io(io::Error::last_os_error()));
@@ -238,7 +259,8 @@ impl Sandbox {
   }
 
   pub fn truncate(&self, path: &str, len: i64) -> Result<(), SandboxError> {
-    let fd = self.open_existing(path, libc::O_WRONLY)?;
+    let fd = self.open_existing(path, libc::O_WRONLY | libc::O_NONBLOCK)?;
+    ensure_regular_file(fd.as_raw_fd())?;
     let rc = unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) };
     if rc < 0 {
       return Err(SandboxError::Io(io::Error::last_os_error()));
@@ -247,9 +269,19 @@ impl Sandbox {
   }
 
   pub fn copy_file(&self, src: &str, dest: &str, mode: u32) -> Result<(), SandboxError> {
-    let src_fd = self.open_existing(src, libc::O_RDONLY)?;
-    let src_stat = self.stat(src)?;
-    let dst_fd = self.open_for_create(dest, true, mode)?;
+    let src_fd = self.open_existing(src, libc::O_RDONLY | libc::O_NONBLOCK)?;
+    let src_stat = ensure_regular_file(src_fd.as_raw_fd())?;
+    let dst_fd = self.open_for_create(dest, false, mode)?;
+    let dst_stat = ensure_regular_file(dst_fd.as_raw_fd())?;
+
+    if src_stat.st_dev == dst_stat.st_dev && src_stat.st_ino == dst_stat.st_ino {
+      return Err(SandboxError::Io(io::Error::from_raw_os_error(libc::EINVAL)));
+    }
+
+    let truncate_rc = unsafe { libc::ftruncate(dst_fd.as_raw_fd(), 0) };
+    if truncate_rc < 0 {
+      return Err(SandboxError::Io(io::Error::last_os_error()));
+    }
 
     let mut src_file: File = src_fd.into();
     let mut dst_file: File = dst_fd.into();
@@ -257,7 +289,12 @@ impl Sandbox {
     dst_file.flush()?;
 
     // Match source permissions as best-effort parity with copy behavior.
-    let rc = unsafe { libc::fchmod(dst_file.as_raw_fd(), src_stat.mode as libc::mode_t) };
+    let rc = unsafe {
+      libc::fchmod(
+        dst_file.as_raw_fd(),
+        (src_stat.st_mode & 0o7777) as libc::mode_t,
+      )
+    };
     if rc < 0 {
       return Err(SandboxError::Io(io::Error::last_os_error()));
     }
@@ -266,13 +303,8 @@ impl Sandbox {
   }
 
   pub fn copy_file_noreplace(&self, src: &str, dest: &str) -> Result<(), SandboxError> {
-    let src_fd = self.open_existing(src, libc::O_RDONLY)?;
-    let mut src_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let stat_rc = unsafe { libc::fstat(src_fd.as_raw_fd(), src_stat.as_mut_ptr()) };
-    if stat_rc < 0 {
-      return Err(SandboxError::Io(io::Error::last_os_error()));
-    }
-    let src_stat = unsafe { src_stat.assume_init() };
+    let src_fd = self.open_existing(src, libc::O_RDONLY | libc::O_NONBLOCK)?;
+    let src_stat = ensure_regular_file(src_fd.as_raw_fd())?;
 
     let dest_components = normalize_relative_components(dest)?;
     let (dest_parent, dest_leaf) = split_parent_leaf(&dest_components)?;
@@ -323,7 +355,8 @@ impl Sandbox {
   }
 
   pub fn open_read_fd(&self, path: &str) -> Result<RawFd, SandboxError> {
-    let fd = self.open_existing(path, libc::O_RDONLY)?;
+    let fd = self.open_existing(path, libc::O_RDONLY | libc::O_NONBLOCK)?;
+    ensure_regular_file(fd.as_raw_fd())?;
     Ok(fd.into_raw_fd())
   }
 
@@ -344,7 +377,7 @@ impl Sandbox {
     let (parent, leaf) = split_parent_leaf(&components)?;
     let parent_fd = self.open_dir_from_root(parent.as_path())?;
 
-    let mut flags = libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let mut flags = libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
     if create {
       flags |= libc::O_CREAT;
     }
@@ -366,11 +399,13 @@ impl Sandbox {
     if fd < 0 {
       return Err(SandboxError::Io(io::Error::last_os_error()));
     }
-    Ok(fd)
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    ensure_regular_file(fd.as_raw_fd())?;
+    Ok(fd.into_raw_fd())
   }
 
   pub fn utimes(&self, path: &str, atime_ns: i64, mtime_ns: i64) -> Result<(), SandboxError> {
-    let fd = self.open_existing(path, libc::O_RDONLY)?;
+    let fd = self.open_existing(path, libc::O_RDONLY | libc::O_NONBLOCK)?;
     let atime = ns_to_timespec(atime_ns);
     let mtime = ns_to_timespec(mtime_ns);
     let times = [atime, mtime];
@@ -449,7 +484,8 @@ impl Sandbox {
     let (parent, leaf) = split_parent_leaf(&components)?;
     let parent_fd = self.open_dir_from_root(parent.as_path())?;
 
-    let mut flags = libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let mut flags =
+      libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
     if truncate {
       flags |= libc::O_TRUNC;
     }
@@ -485,8 +521,7 @@ impl Sandbox {
 
   fn open_dir_from_root_readable(&self, rel_dir: &Path) -> Result<OwnedFd, SandboxError> {
     let rel = if rel_dir.as_os_str().is_empty() {
-      CString::new(".")
-        .map_err(|_| SandboxError::InvalidPath("invalid root path".to_string()))?
+      CString::new(".").map_err(|_| SandboxError::InvalidPath("invalid root path".to_string()))?
     } else {
       cstring_from_os(rel_dir.as_os_str())?
     };
@@ -551,7 +586,8 @@ fn components_to_pathbuf(components: &[OsString]) -> PathBuf {
 }
 
 fn cstring_from_os(value: &OsStr) -> Result<CString, SandboxError> {
-  CString::new(value.as_bytes()).map_err(|_| SandboxError::InvalidPath("path contains NUL byte".to_string()))
+  CString::new(value.as_bytes())
+    .map_err(|_| SandboxError::InvalidPath("path contains NUL byte".to_string()))
 }
 
 fn openat2_fd(
@@ -582,6 +618,24 @@ fn openat2_fd(
   }
 
   Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+fn ensure_regular_file(fd: RawFd) -> Result<libc::stat, SandboxError> {
+  let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+  let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+  if rc < 0 {
+    return Err(SandboxError::Io(io::Error::last_os_error()));
+  }
+  let stat = unsafe { stat.assume_init() };
+  if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+    let errno = if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+      libc::EISDIR
+    } else {
+      libc::EINVAL
+    };
+    return Err(SandboxError::Io(io::Error::from_raw_os_error(errno)));
+  }
+  Ok(stat)
 }
 
 fn dup_fd(fd: RawFd) -> Result<OwnedFd, SandboxError> {
@@ -817,6 +871,32 @@ mod tests {
   }
 
   #[test]
+  fn copy_file_rejects_same_path_without_truncating() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("a.txt"), b"abcdef").unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    let err = sandbox.copy_file("a.txt", "a.txt", 0o644).unwrap_err();
+
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+    assert_eq!(fs::read(root.path().join("a.txt")).unwrap(), b"abcdef");
+  }
+
+  #[test]
+  fn copy_file_rejects_hard_link_alias_without_truncating() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("a.txt"), b"abcdef").unwrap();
+    fs::hard_link(root.path().join("a.txt"), root.path().join("b.txt")).unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    let err = sandbox.copy_file("a.txt", "b.txt", 0o644).unwrap_err();
+
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+    assert_eq!(fs::read(root.path().join("a.txt")).unwrap(), b"abcdef");
+    assert_eq!(fs::read(root.path().join("b.txt")).unwrap(), b"abcdef");
+  }
+
+  #[test]
   fn copy_file_noreplace_creates_destination() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("a.txt"), b"abcdef").unwrap();
@@ -889,11 +969,7 @@ mod tests {
       results
         .iter()
         .filter(|result| {
-          result
-            .as_ref()
-            .err()
-            .and_then(SandboxError::raw_os_error)
-            == Some(libc::EEXIST)
+          result.as_ref().err().and_then(SandboxError::raw_os_error) == Some(libc::EEXIST)
         })
         .count(),
       1
@@ -946,11 +1022,7 @@ mod tests {
     let outside = tempdir().unwrap();
     fs::create_dir_all(root.path().join("d1")).unwrap();
     fs::write(outside.path().join("secret.txt"), b"secret").unwrap();
-    std::os::unix::fs::symlink(
-      outside.path(),
-      root.path().join("d1/outside-link"),
-    )
-    .unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join("d1/outside-link")).unwrap();
 
     let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
     sandbox.remove("d1", true, false).unwrap();
