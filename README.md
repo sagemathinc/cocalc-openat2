@@ -81,8 +81,11 @@ I/O paths in Node. The caller owns the descriptor and must close it.
 `openRead`, `openWrite`, `truncate`, and the copy methods operate on regular
 files only. `copyFile`, `copyFileNoReplace`, and `rm` return Promises and run on
 the libuv worker pool, which is shared with Node's `fs`; callers should bound how
-many run at once. Recursive `rm` refuses trees nested more than 1024 directories
-deep with `ENAMETOOLONG`.
+many run at once. Recursive `rm` refuses trees nested more than 256 directories
+deep with `ENAMETOOLONG`. All recursive removals in a process share a budget of
+directory descriptors (at most 1024 and at most a quarter of the soft
+`RLIMIT_NOFILE`); a removal that would exceed it fails with `EMFILE` and can be
+retried.
 
 `chmod` and `utimes` act through an `O_PATH` handle and `/proc/self/fd`, so they
 do not open the file and do not need read permission. They require `/proc`.

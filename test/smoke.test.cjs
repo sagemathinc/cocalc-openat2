@@ -173,7 +173,7 @@ test('copyFile rejects same-inode destinations without data loss', async () => {
 
 test('rm refuses excessively deep trees and keeps them intact', async () => {
   await withTempDirAsync(async (dir) => {
-    const deep = path.join(dir, 'top', ...Array(1024).fill('d'));
+    const deep = path.join(dir, 'top', ...Array(256).fill('d'));
     fs.mkdirSync(deep, { recursive: true });
     const sandbox = new SandboxRoot(dir);
 
@@ -184,6 +184,80 @@ test('rm refuses excessively deep trees and keeps them intact', async () => {
     await sandbox.rm('top', true, false);
     assert.equal(fs.existsSync(path.join(dir, 'top')), false);
   });
+});
+
+test('concurrent deep rm stays within a low descriptor limit', () => {
+  // With RLIMIT_NOFILE=256 the traversal budget is 64 descriptors for the
+  // whole process. Concurrent removals must fail cleanly instead of taking the
+  // process's other descriptors, and must not leak any.
+  const addon = path.join(__dirname, '..', 'index.js');
+  const script = String.raw`
+    const fs = require('node:fs');
+    const os = require('node:os');
+    const path = require('node:path');
+    const { SandboxRoot } = require(process.argv[2]);
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'openat2-budget-'));
+    const fdCount = () => fs.readdirSync('/proc/self/fd').length;
+    const chain = (name, depth) =>
+      fs.mkdirSync(path.join(dir, name, ...Array(depth).fill('d')), { recursive: true });
+    for (let i = 0; i < 8; i++) chain('t' + i, 50);
+    chain('deep', 100);
+    fs.writeFileSync(path.join(dir, 'probe'), 'x');
+    const sandbox = new SandboxRoot(dir);
+    const baseline = fdCount();
+    const names = ['deep', ...Array.from({ length: 8 }, (_, i) => 't' + i)];
+    let unrelatedEmfile = 0;
+    let settled = false;
+    const results = Promise.all(
+      names.map((name) =>
+        sandbox.rm(name, true, false).then(() => 'ok', (err) => String(err.message)),
+      ),
+    ).finally(() => { settled = true; });
+    const probe = () => {
+      try {
+        fs.closeSync(fs.openSync(path.join(dir, 'probe'), 'r'));
+      } catch (err) {
+        if (err.code === 'EMFILE') unrelatedEmfile++;
+      }
+      if (!settled) setImmediate(probe);
+    };
+    probe();
+    results.then(async (concurrent) => {
+      const sequential = [];
+      for (const name of names) {
+        if (!fs.existsSync(path.join(dir, name))) continue;
+        sequential.push(
+          await sandbox.rm(name, true, false).then(() => name + ':ok', (err) => name + ':' + err.message),
+        );
+      }
+      const leaked = fdCount() - baseline;
+      fs.rmSync(dir, { recursive: true, force: true });
+      console.log(JSON.stringify({ concurrent, sequential, unrelatedEmfile, leaked }));
+    });
+  `;
+  const scriptPath = path.join(os.tmpdir(), `openat2-budget-${process.pid}.cjs`);
+  fs.writeFileSync(scriptPath, script);
+  try {
+    const result = spawnSync(
+      'sh',
+      ['-c', 'ulimit -n 256 && exec "$0" "$1" "$2"', process.execPath, scriptPath, addon],
+      { encoding: 'utf8', timeout: 30_000 },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const out = JSON.parse(result.stdout.trim().split('\n').pop());
+    const budgetError = /^EMFILE: directory traversal descriptor budget of 64 is in use/;
+    for (const r of out.concurrent) {
+      assert.ok(r === 'ok' || budgetError.test(r), r);
+    }
+    // The 100-level tree exceeds the whole 64-descriptor budget on its own.
+    assert.match(out.concurrent[0], budgetError);
+    assert.ok(out.sequential.every((r) => r.endsWith(':ok') || r.startsWith('deep:EMFILE')), out.sequential.join());
+    assert.ok(out.sequential.some((r) => r.startsWith('deep:EMFILE')));
+    assert.equal(out.unrelatedEmfile, 0);
+    assert.equal(out.leaked, 0);
+  } finally {
+    fs.rmSync(scriptPath, { force: true });
+  }
 });
 
 test('special files report specific error codes', async () => {

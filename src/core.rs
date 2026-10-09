@@ -5,6 +5,7 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use thiserror::Error;
 
@@ -28,6 +29,9 @@ pub enum SandboxError {
   #[error("directory nesting exceeds {0} levels")]
   TooDeep(usize),
 
+  #[error("directory traversal descriptor budget of {0} is in use; retry later")]
+  TraversalBudget(usize),
+
   #[error(transparent)]
   Io(#[from] io::Error),
 }
@@ -37,6 +41,7 @@ impl SandboxError {
     match self {
       Self::Io(err) => err.raw_os_error(),
       Self::TooDeep(_) => Some(libc::ENAMETOOLONG),
+      Self::TraversalBudget(_) => Some(libc::EMFILE),
       _ => None,
     }
   }
@@ -78,9 +83,15 @@ const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
 
 /// Deepest directory nesting that recursive removal descends into. Removal
-/// holds one directory descriptor per level, so this also bounds descriptor
-/// use; path-based tools stop far earlier at PATH_MAX.
-pub const MAX_REMOVE_DEPTH: usize = 1024;
+/// holds one directory descriptor per level, so this bounds one call's
+/// descriptor use; realistic trees are far shallower.
+pub const MAX_REMOVE_DEPTH: usize = 256;
+
+/// Process-wide ceiling on directory descriptors held by recursive removals,
+/// further limited by RLIMIT_NOFILE (see traversal_fd_budget).
+pub const MAX_TRAVERSAL_FDS: usize = 1024;
+
+static TRAVERSAL_FDS_IN_USE: AtomicUsize = AtomicUsize::new(0);
 
 impl Sandbox {
   pub fn new(root: &str) -> Result<Self, SandboxError> {
@@ -706,8 +717,9 @@ fn remove_entry(
     Err(err) => return Err(err),
   }
 
-  let child_dir_fd = open_child_dir(parent_fd, leaf, resolve_flags)?;
-  remove_dir_contents(child_dir_fd, force, resolve_flags)?;
+  let permit = TraversalPermit::acquire()?;
+  let child = DirStream::new(open_child_dir(parent_fd, leaf, resolve_flags)?, permit)?;
+  remove_dir_contents(child, force, resolve_flags)?;
 
   match unlinkat(parent_fd, leaf, libc::AT_REMOVEDIR) {
     Ok(()) => Ok(()),
@@ -730,13 +742,55 @@ fn open_child_dir(
   )
 }
 
-/// A readdir stream that owns its directory descriptor.
+/// Directory descriptors that all concurrent recursive removals in this process
+/// may hold: at most MAX_TRAVERSAL_FDS, and at most a quarter of the current
+/// soft RLIMIT_NOFILE, so traversal can never starve the process's other
+/// descriptors whatever the caller's concurrency.
+pub fn traversal_fd_budget() -> usize {
+  let mut limit = libc::rlimit {
+    rlim_cur: 0,
+    rlim_max: 0,
+  };
+  if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0
+    || limit.rlim_cur == libc::RLIM_INFINITY
+  {
+    return MAX_TRAVERSAL_FDS;
+  }
+  usize::try_from(limit.rlim_cur / 4)
+    .unwrap_or(MAX_TRAVERSAL_FDS)
+    .clamp(1, MAX_TRAVERSAL_FDS)
+}
+
+/// One unit of the process-wide traversal descriptor budget, held for as long
+/// as the corresponding directory descriptor is open.
+struct TraversalPermit;
+
+impl TraversalPermit {
+  fn acquire() -> Result<Self, SandboxError> {
+    let budget = traversal_fd_budget();
+    if TRAVERSAL_FDS_IN_USE.fetch_add(1, Ordering::AcqRel) >= budget {
+      TRAVERSAL_FDS_IN_USE.fetch_sub(1, Ordering::AcqRel);
+      return Err(SandboxError::TraversalBudget(budget));
+    }
+    Ok(Self)
+  }
+}
+
+impl Drop for TraversalPermit {
+  fn drop(&mut self) {
+    TRAVERSAL_FDS_IN_USE.fetch_sub(1, Ordering::AcqRel);
+  }
+}
+
+/// A readdir stream that owns its directory descriptor and the budget permit
+/// for it. The permit field is dropped after Drop::drop closes the stream.
 struct DirStream {
   dir: *mut libc::DIR,
+  _permit: TraversalPermit,
 }
 
 impl DirStream {
-  fn new(fd: OwnedFd) -> Result<Self, SandboxError> {
+  fn new(fd: OwnedFd, permit: TraversalPermit) -> Result<Self, SandboxError> {
     let raw_fd = fd.into_raw_fd();
     let dir = unsafe { libc::fdopendir(raw_fd) };
     if dir.is_null() {
@@ -744,7 +798,10 @@ impl DirStream {
       let _ = unsafe { libc::close(raw_fd) };
       return Err(SandboxError::Io(err));
     }
-    Ok(Self { dir })
+    Ok(Self {
+      dir,
+      _permit: permit,
+    })
   }
 
   fn fd(&self) -> RawFd {
@@ -781,15 +838,15 @@ impl Drop for DirStream {
   }
 }
 
-/// Removes everything below `dir_fd` without recursion: one heap frame and one
-/// descriptor per directory level, capped at MAX_REMOVE_DEPTH levels.
+/// Removes everything below `dir` without recursion: one heap frame and one
+/// budgeted descriptor per directory level, capped at MAX_REMOVE_DEPTH levels.
 fn remove_dir_contents(
-  dir_fd: OwnedFd,
+  dir: DirStream,
   force: bool,
   resolve_flags: u64,
 ) -> Result<(), SandboxError> {
   // Each frame is an open directory and its name in the parent frame.
-  let mut stack: Vec<(DirStream, Option<CString>)> = vec![(DirStream::new(dir_fd)?, None)];
+  let mut stack: Vec<(DirStream, Option<CString>)> = vec![(dir, None)];
 
   while let Some((dir, _)) = stack.last_mut() {
     let current_fd = dir.fd();
@@ -815,7 +872,8 @@ fn remove_dir_contents(
     if stack.len() >= MAX_REMOVE_DEPTH {
       return Err(SandboxError::TooDeep(MAX_REMOVE_DEPTH));
     }
-    let child = DirStream::new(open_child_dir(current_fd, &name, resolve_flags)?)?;
+    let permit = TraversalPermit::acquire()?;
+    let child = DirStream::new(open_child_dir(current_fd, &name, resolve_flags)?, permit)?;
     stack.push((child, Some(name)));
   }
 
@@ -1051,8 +1109,28 @@ mod tests {
     assert_eq!(link_target, PathBuf::from("a.txt"));
   }
 
+  // Recursive removals share the process-wide traversal budget, so tests that
+  // remove trees run one at a time. Like Node at startup, raise the soft
+  // descriptor limit to the hard limit so the budget is not artificially small.
+  fn removal_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut limit = libc::rlimit {
+      rlim_cur: 0,
+      rlim_max: 0,
+    };
+    unsafe {
+      if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 && limit.rlim_cur < limit.rlim_max {
+        limit.rlim_cur = limit.rlim_max;
+        libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+      }
+    }
+    guard
+  }
+
   #[test]
   fn remove_recursive_removes_tree() {
+    let _guard = removal_guard();
     let root = tempdir().unwrap();
     fs::create_dir_all(root.path().join("d1/d2")).unwrap();
     fs::write(root.path().join("d1/d2/f.txt"), b"x").unwrap();
@@ -1065,6 +1143,7 @@ mod tests {
 
   #[test]
   fn remove_recursive_does_not_follow_symlink() {
+    let _guard = removal_guard();
     let root = tempdir().unwrap();
     let outside = tempdir().unwrap();
     fs::create_dir_all(root.path().join("d1")).unwrap();
@@ -1089,6 +1168,7 @@ mod tests {
 
   #[test]
   fn remove_recursive_resumes_parent_after_subdirectories() {
+    let _guard = removal_guard();
     let root = tempdir().unwrap();
     for dir in ["t/a/b", "t/c", "t/e/f/g"] {
       fs::create_dir_all(root.path().join(dir)).unwrap();
@@ -1113,6 +1193,11 @@ mod tests {
 
   #[test]
   fn remove_recursive_allows_maximum_depth() {
+    let _guard = removal_guard();
+    if traversal_fd_budget() < MAX_REMOVE_DEPTH {
+      eprintln!("skipping: descriptor limit leaves a budget below MAX_REMOVE_DEPTH");
+      return;
+    }
     let root = tempdir().unwrap();
     let deepest = nested_dirs(&root.path().join("top"), MAX_REMOVE_DEPTH - 1);
     fs::write(deepest.join("f.txt"), b"x").unwrap();
@@ -1125,6 +1210,7 @@ mod tests {
 
   #[test]
   fn remove_recursive_rejects_excessive_depth() {
+    let _guard = removal_guard();
     let root = tempdir().unwrap();
     nested_dirs(&root.path().join("top"), MAX_REMOVE_DEPTH);
 
@@ -1134,6 +1220,51 @@ mod tests {
     assert!(matches!(err, SandboxError::TooDeep(MAX_REMOVE_DEPTH)));
     assert_eq!(err.raw_os_error(), Some(libc::ENAMETOOLONG));
     assert!(root.path().join("top").exists());
+    assert_eq!(TRAVERSAL_FDS_IN_USE.load(Ordering::Acquire), 0);
+  }
+
+  #[test]
+  fn traversal_budget_respects_descriptor_limit() {
+    let budget = traversal_fd_budget();
+    assert!((1..=MAX_TRAVERSAL_FDS).contains(&budget));
+    let mut limit = libc::rlimit {
+      rlim_cur: 0,
+      rlim_max: 0,
+    };
+    assert_eq!(
+      unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+      0
+    );
+    if limit.rlim_cur != libc::RLIM_INFINITY {
+      assert!(budget as u64 <= (limit.rlim_cur / 4).max(1));
+    }
+  }
+
+  #[test]
+  fn remove_recursive_fails_cleanly_when_traversal_budget_is_exhausted() {
+    let _guard = removal_guard();
+    let root = tempdir().unwrap();
+    fs::create_dir_all(root.path().join("t/a")).unwrap();
+    fs::write(root.path().join("t/a/f.txt"), b"x").unwrap();
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+
+    // Hold the whole budget, as concurrent removals elsewhere could.
+    let mut held = Vec::new();
+    while let Ok(permit) = TraversalPermit::acquire() {
+      held.push(permit);
+    }
+    assert_eq!(held.len(), traversal_fd_budget());
+
+    let err = sandbox.remove("t", true, false).unwrap_err();
+    assert!(matches!(err, SandboxError::TraversalBudget(_)));
+    assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
+    assert!(root.path().join("t/a/f.txt").exists());
+
+    drop(held);
+    assert_eq!(TRAVERSAL_FDS_IN_USE.load(Ordering::Acquire), 0);
+    sandbox.remove("t", true, false).unwrap();
+    assert!(!root.path().join("t").exists());
+    assert_eq!(TRAVERSAL_FDS_IN_USE.load(Ordering::Acquire), 0);
   }
 
   #[test]
