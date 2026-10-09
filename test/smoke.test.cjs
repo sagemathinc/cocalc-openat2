@@ -171,6 +171,35 @@ test('copyFile rejects same-inode destinations without data loss', async () => {
   });
 });
 
+test('rm refuses excessively deep trees and keeps them intact', async () => {
+  await withTempDirAsync(async (dir) => {
+    const deep = path.join(dir, 'top', ...Array(1024).fill('d'));
+    fs.mkdirSync(deep, { recursive: true });
+    const sandbox = new SandboxRoot(dir);
+
+    await assert.rejects(sandbox.rm('top', true, false), /^Error: ENAMETOOLONG: /);
+    assert.equal(fs.existsSync(deep), true);
+
+    fs.rmdirSync(deep);
+    await sandbox.rm('top', true, false);
+    assert.equal(fs.existsSync(path.join(dir, 'top')), false);
+  });
+});
+
+test('special files report specific error codes', async () => {
+  await withTempDirAsync(async (dir) => {
+    spawnSync('mkfifo', [path.join(dir, 'fifo')], { stdio: 'inherit' });
+    const sandbox = new SandboxRoot(dir);
+
+    assert.throws(() => sandbox.openRead('fifo'), /^Error: EINVAL: /);
+    assert.throws(() => sandbox.openWrite('fifo'), /^Error: ENXIO: /);
+    assert.throws(() => sandbox.truncate('fifo', 0), /^Error: ENXIO: /);
+    await assert.rejects(sandbox.copyFile('fifo', 'copy'), /^Error: EINVAL: /);
+    sandbox.chmod('fifo', 0o600);
+    assert.equal(fs.statSync(path.join(dir, 'fifo')).mode & 0o7777, 0o600);
+  });
+});
+
 test('FIFO operations return without blocking the Node process', () => {
   const addon = path.join(__dirname, '..', 'index.js');
   const operations = [

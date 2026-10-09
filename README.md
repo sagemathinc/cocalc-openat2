@@ -78,9 +78,17 @@ Methods implemented now:
 `openRead`/`openWrite` return numeric file descriptors intended for high-frequency
 I/O paths in Node. The caller owns the descriptor and must close it.
 
-Content I/O accepts regular files only. Special files such as FIFOs are rejected
-without performing a blocking open on the JavaScript main thread. Copying and
-recursive removal run on the napi-rs worker pool.
+`openRead`, `openWrite`, `truncate`, and the copy methods operate on regular
+files only. `copyFile`, `copyFileNoReplace`, and `rm` return Promises and run on
+the libuv worker pool, which is shared with Node's `fs`; callers should bound how
+many run at once. Recursive `rm` refuses trees nested more than 1024 directories
+deep with `ENAMETOOLONG`.
+
+`chmod` and `utimes` act through an `O_PATH` handle and `/proc/self/fd`, so they
+do not open the file and do not need read permission. They require `/proc`.
+
+Errors are thrown with Node-style code prefixes such as `ENOENT: ...`; errno
+values without a known name use `UNKNOWN`.
 
 `copyFileNoReplace` copies into an unnamed file in the destination directory,
 then publishes it atomically only if the destination does not exist. It requires

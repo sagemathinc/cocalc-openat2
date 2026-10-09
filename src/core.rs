@@ -25,6 +25,9 @@ pub enum SandboxError {
   #[error("invalid path: {0}")]
   InvalidPath(String),
 
+  #[error("directory nesting exceeds {0} levels")]
+  TooDeep(usize),
+
   #[error(transparent)]
   Io(#[from] io::Error),
 }
@@ -33,6 +36,7 @@ impl SandboxError {
   pub fn raw_os_error(&self) -> Option<i32> {
     match self {
       Self::Io(err) => err.raw_os_error(),
+      Self::TooDeep(_) => Some(libc::ENAMETOOLONG),
       _ => None,
     }
   }
@@ -72,6 +76,11 @@ struct OpenHow {
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
+
+/// Deepest directory nesting that recursive removal descends into. Removal
+/// holds one directory descriptor per level, so this also bounds descriptor
+/// use; path-based tools stop far earlier at PATH_MAX.
+pub const MAX_REMOVE_DEPTH: usize = 1024;
 
 impl Sandbox {
   pub fn new(root: &str) -> Result<Self, SandboxError> {
@@ -250,8 +259,12 @@ impl Sandbox {
   }
 
   pub fn chmod(&self, path: &str, mode: u32) -> Result<(), SandboxError> {
-    let fd = self.open_existing(path, libc::O_RDONLY | libc::O_NONBLOCK)?;
-    let rc = unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) };
+    // An O_PATH handle never opens the inode itself, so this needs no read
+    // permission and has no FIFO or device open side effects. The magic link
+    // refers to exactly this inode.
+    let fd = self.open_existing(path, libc::O_PATH)?;
+    let proc_path = proc_fd_path(fd.as_raw_fd());
+    let rc = unsafe { libc::chmod(proc_path.as_ptr(), mode as libc::mode_t) };
     if rc < 0 {
       return Err(SandboxError::Io(io::Error::last_os_error()));
     }
@@ -405,11 +418,13 @@ impl Sandbox {
   }
 
   pub fn utimes(&self, path: &str, atime_ns: i64, mtime_ns: i64) -> Result<(), SandboxError> {
-    let fd = self.open_existing(path, libc::O_RDONLY | libc::O_NONBLOCK)?;
+    // Same O_PATH pattern as chmod.
+    let fd = self.open_existing(path, libc::O_PATH)?;
+    let proc_path = proc_fd_path(fd.as_raw_fd());
     let atime = ns_to_timespec(atime_ns);
     let mtime = ns_to_timespec(mtime_ns);
     let times = [atime, mtime];
-    let rc = unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) };
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, proc_path.as_ptr(), times.as_ptr(), 0) };
     if rc < 0 {
       return Err(SandboxError::Io(io::Error::last_os_error()));
     }
@@ -638,6 +653,10 @@ fn ensure_regular_file(fd: RawFd) -> Result<libc::stat, SandboxError> {
   Ok(stat)
 }
 
+fn proc_fd_path(fd: RawFd) -> CString {
+  CString::new(format!("/proc/self/fd/{fd}")).expect("formatted path has no NUL byte")
+}
+
 fn dup_fd(fd: RawFd) -> Result<OwnedFd, SandboxError> {
   let new_fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
   if new_fd < 0 {
@@ -687,14 +706,8 @@ fn remove_entry(
     Err(err) => return Err(err),
   }
 
-  let child_dir_fd = openat2_fd(
-    parent_fd,
-    leaf,
-    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-    0,
-    resolve_flags,
-  )?;
-  remove_dir_contents(child_dir_fd.as_raw_fd(), force, resolve_flags)?;
+  let child_dir_fd = open_child_dir(parent_fd, leaf, resolve_flags)?;
+  remove_dir_contents(child_dir_fd, force, resolve_flags)?;
 
   match unlinkat(parent_fd, leaf, libc::AT_REMOVEDIR) {
     Ok(()) => Ok(()),
@@ -703,76 +716,110 @@ fn remove_entry(
   }
 }
 
-fn remove_dir_contents(dir_fd: RawFd, force: bool, resolve_flags: u64) -> Result<(), SandboxError> {
-  let iter_fd = dup_fd(dir_fd)?;
-  let raw_fd = iter_fd.into_raw_fd();
-  let dir_ptr = unsafe { libc::fdopendir(raw_fd) };
-  if dir_ptr.is_null() {
-    let _ = unsafe { libc::close(raw_fd) };
-    return Err(SandboxError::Io(io::Error::last_os_error()));
+fn open_child_dir(
+  parent_fd: RawFd,
+  leaf: &CString,
+  resolve_flags: u64,
+) -> Result<OwnedFd, SandboxError> {
+  openat2_fd(
+    parent_fd,
+    leaf,
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    0,
+    resolve_flags,
+  )
+}
+
+/// A readdir stream that owns its directory descriptor.
+struct DirStream {
+  dir: *mut libc::DIR,
+}
+
+impl DirStream {
+  fn new(fd: OwnedFd) -> Result<Self, SandboxError> {
+    let raw_fd = fd.into_raw_fd();
+    let dir = unsafe { libc::fdopendir(raw_fd) };
+    if dir.is_null() {
+      let err = io::Error::last_os_error();
+      let _ = unsafe { libc::close(raw_fd) };
+      return Err(SandboxError::Io(err));
+    }
+    Ok(Self { dir })
   }
 
-  loop {
+  fn fd(&self) -> RawFd {
+    unsafe { libc::dirfd(self.dir) }
+  }
+
+  fn next_name(&mut self) -> Result<Option<CString>, SandboxError> {
+    loop {
+      unsafe {
+        *libc::__errno_location() = 0;
+      }
+      let entry = unsafe { libc::readdir(self.dir) };
+      if entry.is_null() {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(0) {
+          return Ok(None);
+        }
+        return Err(SandboxError::Io(err));
+      }
+      let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+      if name.to_bytes() == b"." || name.to_bytes() == b".." {
+        continue;
+      }
+      return Ok(Some(name.to_owned()));
+    }
+  }
+}
+
+impl Drop for DirStream {
+  fn drop(&mut self) {
     unsafe {
-      *libc::__errno_location() = 0;
+      libc::closedir(self.dir);
     }
-    let entry = unsafe { libc::readdir(dir_ptr) };
-    if entry.is_null() {
-      let errno = io::Error::last_os_error();
-      let closed = unsafe { libc::closedir(dir_ptr) };
-      if closed < 0 {
-        return Err(SandboxError::Io(io::Error::last_os_error()));
-      }
-      if errno.raw_os_error() == Some(0) {
-        return Ok(());
-      }
-      return Err(SandboxError::Io(errno));
-    }
+  }
+}
 
-    let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-    if name.to_bytes() == b"." || name.to_bytes() == b".." {
+/// Removes everything below `dir_fd` without recursion: one heap frame and one
+/// descriptor per directory level, capped at MAX_REMOVE_DEPTH levels.
+fn remove_dir_contents(
+  dir_fd: OwnedFd,
+  force: bool,
+  resolve_flags: u64,
+) -> Result<(), SandboxError> {
+  // Each frame is an open directory and its name in the parent frame.
+  let mut stack: Vec<(DirStream, Option<CString>)> = vec![(DirStream::new(dir_fd)?, None)];
+
+  while let Some((dir, _)) = stack.last_mut() {
+    let current_fd = dir.fd();
+    let Some(name) = dir.next_name()? else {
+      let (finished, name) = stack.pop().expect("stack is not empty");
+      drop(finished);
+      if let (Some(name), Some((parent, _))) = (name, stack.last()) {
+        unlinkat(parent.fd(), &name, libc::AT_REMOVEDIR)?;
+      }
       continue;
-    }
-    let c_name = CString::new(name.to_bytes())
-      .map_err(|_| SandboxError::InvalidPath("directory entry contains NUL byte".to_string()))?;
+    };
 
-    match unlinkat(dir_fd, &c_name, 0) {
+    match unlinkat(current_fd, &name, 0) {
       Ok(()) => continue,
       Err(SandboxError::Io(err)) if force && err.raw_os_error() == Some(libc::ENOENT) => {
         continue;
       }
       Err(SandboxError::Io(err))
         if matches!(err.raw_os_error(), Some(libc::EISDIR) | Some(libc::EPERM)) => {}
-      Err(err) => {
-        let _ = unsafe { libc::closedir(dir_ptr) };
-        return Err(err);
-      }
+      Err(err) => return Err(err),
     }
 
-    let child_dir_fd = match openat2_fd(
-      dir_fd,
-      &c_name,
-      libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-      0,
-      resolve_flags,
-    ) {
-      Ok(fd) => fd,
-      Err(err) => {
-        let _ = unsafe { libc::closedir(dir_ptr) };
-        return Err(err);
-      }
-    };
-
-    if let Err(err) = remove_dir_contents(child_dir_fd.as_raw_fd(), force, resolve_flags) {
-      let _ = unsafe { libc::closedir(dir_ptr) };
-      return Err(err);
+    if stack.len() >= MAX_REMOVE_DEPTH {
+      return Err(SandboxError::TooDeep(MAX_REMOVE_DEPTH));
     }
-
-    if let Err(err) = unlinkat(dir_fd, &c_name, libc::AT_REMOVEDIR) {
-      let _ = unsafe { libc::closedir(dir_ptr) };
-      return Err(err);
-    }
+    let child = DirStream::new(open_child_dir(current_fd, &name, resolve_flags)?)?;
+    stack.push((child, Some(name)));
   }
+
+  Ok(())
 }
 
 fn ns_to_timespec(ns: i64) -> libc::timespec {
@@ -1029,6 +1076,101 @@ mod tests {
 
     assert!(outside.path().join("secret.txt").exists());
     assert!(!root.path().join("d1").exists());
+  }
+
+  fn nested_dirs(top: &Path, levels: usize) -> PathBuf {
+    let mut path = top.to_path_buf();
+    for _ in 0..levels {
+      path.push("d");
+    }
+    fs::create_dir_all(&path).unwrap();
+    path
+  }
+
+  #[test]
+  fn remove_recursive_resumes_parent_after_subdirectories() {
+    let root = tempdir().unwrap();
+    for dir in ["t/a/b", "t/c", "t/e/f/g"] {
+      fs::create_dir_all(root.path().join(dir)).unwrap();
+    }
+    for file in [
+      "t/1",
+      "t/a/2",
+      "t/a/b/3",
+      "t/c/4",
+      "t/e/5",
+      "t/e/f/g/6",
+      "t/z",
+    ] {
+      fs::write(root.path().join(file), b"x").unwrap();
+    }
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    sandbox.remove("t", true, false).unwrap();
+
+    assert!(!root.path().join("t").exists());
+  }
+
+  #[test]
+  fn remove_recursive_allows_maximum_depth() {
+    let root = tempdir().unwrap();
+    let deepest = nested_dirs(&root.path().join("top"), MAX_REMOVE_DEPTH - 1);
+    fs::write(deepest.join("f.txt"), b"x").unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    sandbox.remove("top", true, false).unwrap();
+
+    assert!(!root.path().join("top").exists());
+  }
+
+  #[test]
+  fn remove_recursive_rejects_excessive_depth() {
+    let root = tempdir().unwrap();
+    nested_dirs(&root.path().join("top"), MAX_REMOVE_DEPTH);
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    let err = sandbox.remove("top", true, false).unwrap_err();
+
+    assert!(matches!(err, SandboxError::TooDeep(MAX_REMOVE_DEPTH)));
+    assert_eq!(err.raw_os_error(), Some(libc::ENAMETOOLONG));
+    assert!(root.path().join("top").exists());
+  }
+
+  #[test]
+  fn chmod_and_utimes_do_not_require_read_permission() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = tempdir().unwrap();
+    let file = root.path().join("locked.txt");
+    fs::write(&file, b"x").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    sandbox
+      .utimes("locked.txt", 1_000_000_000, 2_000_000_000)
+      .unwrap();
+    sandbox.chmod("locked.txt", 0o640).unwrap();
+
+    let meta = fs::metadata(&file).unwrap();
+    assert_eq!(meta.mode() & 0o7777, 0o640);
+    assert_eq!(meta.mtime(), 2);
+  }
+
+  #[test]
+  fn chmod_and_utimes_do_not_open_fifos() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = tempdir().unwrap();
+    let fifo = cstring_from_os(root.path().join("fifo").as_os_str()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    sandbox.chmod("fifo", 0o600).unwrap();
+    sandbox.utimes("fifo", 0, 3_000_000_000).unwrap();
+
+    let meta = fs::metadata(root.path().join("fifo")).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
+    assert_eq!(meta.mtime(), 3);
   }
 
   #[test]
