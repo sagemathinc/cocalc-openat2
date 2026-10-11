@@ -5,6 +5,7 @@ use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use thiserror::Error;
 
@@ -25,6 +26,12 @@ pub enum SandboxError {
   #[error("invalid path: {0}")]
   InvalidPath(String),
 
+  #[error("directory nesting exceeds {0} levels")]
+  TooDeep(usize),
+
+  #[error("directory traversal descriptor budget of {0} is in use; retry later")]
+  TraversalBudget(usize),
+
   #[error(transparent)]
   Io(#[from] io::Error),
 }
@@ -33,6 +40,8 @@ impl SandboxError {
   pub fn raw_os_error(&self) -> Option<i32> {
     match self {
       Self::Io(err) => err.raw_os_error(),
+      Self::TooDeep(_) => Some(libc::ENAMETOOLONG),
+      Self::TraversalBudget(_) => Some(libc::EMFILE),
       _ => None,
     }
   }
@@ -73,6 +82,17 @@ const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 const RESOLVE_BENEATH: u64 = 0x08;
 
+/// Deepest directory nesting that recursive removal descends into. Removal
+/// holds one directory descriptor per level, so this bounds one call's
+/// descriptor use; realistic trees are far shallower.
+pub const MAX_REMOVE_DEPTH: usize = 256;
+
+/// Process-wide ceiling on directory descriptors held by recursive removals,
+/// further limited by RLIMIT_NOFILE (see traversal_fd_budget).
+pub const MAX_TRAVERSAL_FDS: usize = 1024;
+
+static TRAVERSAL_FDS_IN_USE: AtomicUsize = AtomicUsize::new(0);
+
 impl Sandbox {
   pub fn new(root: &str) -> Result<Self, SandboxError> {
     let canonical = std::fs::canonicalize(root)?;
@@ -87,18 +107,33 @@ impl Sandbox {
       return Err(SandboxError::Io(io::Error::last_os_error()));
     }
 
-    Ok(Self {
+    let sandbox = Self {
       root_fd: unsafe { OwnedFd::from_raw_fd(fd) },
       resolve_flags: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS,
+    };
+
+    // Fail construction when the kernel or syscall policy does not actually
+    // support the confinement primitive this type promises.
+    let dot = CString::new(".").expect("static string has no NUL byte");
+    drop(openat2_fd(
+      sandbox.root_fd.as_raw_fd(),
+      &dot,
+      libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+      0,
+      sandbox.resolve_flags,
+    )?);
+
+    Ok(sandbox)
+  }
+
+  pub fn try_clone(&self) -> Result<Self, SandboxError> {
+    Ok(Self {
+      root_fd: dup_fd(self.root_fd.as_raw_fd())?,
+      resolve_flags: self.resolve_flags,
     })
   }
 
-  pub fn mkdir(
-    &self,
-    path: &str,
-    recursive: bool,
-    mode: u32,
-  ) -> Result<(), SandboxError> {
+  pub fn mkdir(&self, path: &str, recursive: bool, mode: u32) -> Result<(), SandboxError> {
     let components = normalize_relative_components(path)?;
     if components.is_empty() {
       return Err(SandboxError::EmptyPath);
@@ -208,7 +243,13 @@ impl Sandbox {
     let c_target = CString::new(target.as_bytes())
       .map_err(|_| SandboxError::InvalidPath("symlink target contains NUL byte".to_string()))?;
 
-    let rc = unsafe { libc::symlinkat(c_target.as_ptr(), new_parent_fd.as_raw_fd(), new_leaf.as_ptr()) };
+    let rc = unsafe {
+      libc::symlinkat(
+        c_target.as_ptr(),
+        new_parent_fd.as_raw_fd(),
+        new_leaf.as_ptr(),
+      )
+    };
     if rc < 0 {
       return Err(SandboxError::Io(io::Error::last_os_error()));
     }
@@ -229,8 +270,12 @@ impl Sandbox {
   }
 
   pub fn chmod(&self, path: &str, mode: u32) -> Result<(), SandboxError> {
-    let fd = self.open_existing(path, libc::O_RDONLY)?;
-    let rc = unsafe { libc::fchmod(fd.as_raw_fd(), mode as libc::mode_t) };
+    // An O_PATH handle never opens the inode itself, so this needs no read
+    // permission and has no FIFO or device open side effects. The magic link
+    // refers to exactly this inode.
+    let fd = self.open_existing(path, libc::O_PATH)?;
+    let proc_path = proc_fd_path(fd.as_raw_fd());
+    let rc = unsafe { libc::chmod(proc_path.as_ptr(), mode as libc::mode_t) };
     if rc < 0 {
       return Err(SandboxError::Io(io::Error::last_os_error()));
     }
@@ -238,7 +283,8 @@ impl Sandbox {
   }
 
   pub fn truncate(&self, path: &str, len: i64) -> Result<(), SandboxError> {
-    let fd = self.open_existing(path, libc::O_WRONLY)?;
+    let fd = self.open_existing(path, libc::O_WRONLY | libc::O_NONBLOCK)?;
+    ensure_regular_file(fd.as_raw_fd())?;
     let rc = unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) };
     if rc < 0 {
       return Err(SandboxError::Io(io::Error::last_os_error()));
@@ -247,9 +293,19 @@ impl Sandbox {
   }
 
   pub fn copy_file(&self, src: &str, dest: &str, mode: u32) -> Result<(), SandboxError> {
-    let src_fd = self.open_existing(src, libc::O_RDONLY)?;
-    let src_stat = self.stat(src)?;
-    let dst_fd = self.open_for_create(dest, true, mode)?;
+    let src_fd = self.open_existing(src, libc::O_RDONLY | libc::O_NONBLOCK)?;
+    let src_stat = ensure_regular_file(src_fd.as_raw_fd())?;
+    let dst_fd = self.open_for_create(dest, false, mode)?;
+    let dst_stat = ensure_regular_file(dst_fd.as_raw_fd())?;
+
+    if src_stat.st_dev == dst_stat.st_dev && src_stat.st_ino == dst_stat.st_ino {
+      return Err(SandboxError::Io(io::Error::from_raw_os_error(libc::EINVAL)));
+    }
+
+    let truncate_rc = unsafe { libc::ftruncate(dst_fd.as_raw_fd(), 0) };
+    if truncate_rc < 0 {
+      return Err(SandboxError::Io(io::Error::last_os_error()));
+    }
 
     let mut src_file: File = src_fd.into();
     let mut dst_file: File = dst_fd.into();
@@ -257,7 +313,12 @@ impl Sandbox {
     dst_file.flush()?;
 
     // Match source permissions as best-effort parity with copy behavior.
-    let rc = unsafe { libc::fchmod(dst_file.as_raw_fd(), src_stat.mode as libc::mode_t) };
+    let rc = unsafe {
+      libc::fchmod(
+        dst_file.as_raw_fd(),
+        (src_stat.st_mode & 0o7777) as libc::mode_t,
+      )
+    };
     if rc < 0 {
       return Err(SandboxError::Io(io::Error::last_os_error()));
     }
@@ -266,13 +327,8 @@ impl Sandbox {
   }
 
   pub fn copy_file_noreplace(&self, src: &str, dest: &str) -> Result<(), SandboxError> {
-    let src_fd = self.open_existing(src, libc::O_RDONLY)?;
-    let mut src_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let stat_rc = unsafe { libc::fstat(src_fd.as_raw_fd(), src_stat.as_mut_ptr()) };
-    if stat_rc < 0 {
-      return Err(SandboxError::Io(io::Error::last_os_error()));
-    }
-    let src_stat = unsafe { src_stat.assume_init() };
+    let src_fd = self.open_existing(src, libc::O_RDONLY | libc::O_NONBLOCK)?;
+    let src_stat = ensure_regular_file(src_fd.as_raw_fd())?;
 
     let dest_components = normalize_relative_components(dest)?;
     let (dest_parent, dest_leaf) = split_parent_leaf(&dest_components)?;
@@ -323,7 +379,8 @@ impl Sandbox {
   }
 
   pub fn open_read_fd(&self, path: &str) -> Result<RawFd, SandboxError> {
-    let fd = self.open_existing(path, libc::O_RDONLY)?;
+    let fd = self.open_existing(path, libc::O_RDONLY | libc::O_NONBLOCK)?;
+    ensure_regular_file(fd.as_raw_fd())?;
     Ok(fd.into_raw_fd())
   }
 
@@ -344,7 +401,7 @@ impl Sandbox {
     let (parent, leaf) = split_parent_leaf(&components)?;
     let parent_fd = self.open_dir_from_root(parent.as_path())?;
 
-    let mut flags = libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let mut flags = libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
     if create {
       flags |= libc::O_CREAT;
     }
@@ -366,15 +423,19 @@ impl Sandbox {
     if fd < 0 {
       return Err(SandboxError::Io(io::Error::last_os_error()));
     }
-    Ok(fd)
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    ensure_regular_file(fd.as_raw_fd())?;
+    Ok(fd.into_raw_fd())
   }
 
   pub fn utimes(&self, path: &str, atime_ns: i64, mtime_ns: i64) -> Result<(), SandboxError> {
-    let fd = self.open_existing(path, libc::O_RDONLY)?;
+    // Same O_PATH pattern as chmod.
+    let fd = self.open_existing(path, libc::O_PATH)?;
+    let proc_path = proc_fd_path(fd.as_raw_fd());
     let atime = ns_to_timespec(atime_ns);
     let mtime = ns_to_timespec(mtime_ns);
     let times = [atime, mtime];
-    let rc = unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) };
+    let rc = unsafe { libc::utimensat(libc::AT_FDCWD, proc_path.as_ptr(), times.as_ptr(), 0) };
     if rc < 0 {
       return Err(SandboxError::Io(io::Error::last_os_error()));
     }
@@ -449,7 +510,8 @@ impl Sandbox {
     let (parent, leaf) = split_parent_leaf(&components)?;
     let parent_fd = self.open_dir_from_root(parent.as_path())?;
 
-    let mut flags = libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let mut flags =
+      libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
     if truncate {
       flags |= libc::O_TRUNC;
     }
@@ -485,8 +547,7 @@ impl Sandbox {
 
   fn open_dir_from_root_readable(&self, rel_dir: &Path) -> Result<OwnedFd, SandboxError> {
     let rel = if rel_dir.as_os_str().is_empty() {
-      CString::new(".")
-        .map_err(|_| SandboxError::InvalidPath("invalid root path".to_string()))?
+      CString::new(".").map_err(|_| SandboxError::InvalidPath("invalid root path".to_string()))?
     } else {
       cstring_from_os(rel_dir.as_os_str())?
     };
@@ -551,7 +612,8 @@ fn components_to_pathbuf(components: &[OsString]) -> PathBuf {
 }
 
 fn cstring_from_os(value: &OsStr) -> Result<CString, SandboxError> {
-  CString::new(value.as_bytes()).map_err(|_| SandboxError::InvalidPath("path contains NUL byte".to_string()))
+  CString::new(value.as_bytes())
+    .map_err(|_| SandboxError::InvalidPath("path contains NUL byte".to_string()))
 }
 
 fn openat2_fd(
@@ -582,6 +644,28 @@ fn openat2_fd(
   }
 
   Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+}
+
+fn ensure_regular_file(fd: RawFd) -> Result<libc::stat, SandboxError> {
+  let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+  let rc = unsafe { libc::fstat(fd, stat.as_mut_ptr()) };
+  if rc < 0 {
+    return Err(SandboxError::Io(io::Error::last_os_error()));
+  }
+  let stat = unsafe { stat.assume_init() };
+  if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+    let errno = if stat.st_mode & libc::S_IFMT == libc::S_IFDIR {
+      libc::EISDIR
+    } else {
+      libc::EINVAL
+    };
+    return Err(SandboxError::Io(io::Error::from_raw_os_error(errno)));
+  }
+  Ok(stat)
+}
+
+fn proc_fd_path(fd: RawFd) -> CString {
+  CString::new(format!("/proc/self/fd/{fd}")).expect("formatted path has no NUL byte")
 }
 
 fn dup_fd(fd: RawFd) -> Result<OwnedFd, SandboxError> {
@@ -633,14 +717,9 @@ fn remove_entry(
     Err(err) => return Err(err),
   }
 
-  let child_dir_fd = openat2_fd(
-    parent_fd,
-    leaf,
-    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-    0,
-    resolve_flags,
-  )?;
-  remove_dir_contents(child_dir_fd.as_raw_fd(), force, resolve_flags)?;
+  let permit = TraversalPermit::acquire()?;
+  let child = DirStream::new(open_child_dir(parent_fd, leaf, resolve_flags)?, permit)?;
+  remove_dir_contents(child, force, resolve_flags)?;
 
   match unlinkat(parent_fd, leaf, libc::AT_REMOVEDIR) {
     Ok(()) => Ok(()),
@@ -649,76 +728,156 @@ fn remove_entry(
   }
 }
 
-fn remove_dir_contents(dir_fd: RawFd, force: bool, resolve_flags: u64) -> Result<(), SandboxError> {
-  let iter_fd = dup_fd(dir_fd)?;
-  let raw_fd = iter_fd.into_raw_fd();
-  let dir_ptr = unsafe { libc::fdopendir(raw_fd) };
-  if dir_ptr.is_null() {
-    let _ = unsafe { libc::close(raw_fd) };
-    return Err(SandboxError::Io(io::Error::last_os_error()));
+fn open_child_dir(
+  parent_fd: RawFd,
+  leaf: &CString,
+  resolve_flags: u64,
+) -> Result<OwnedFd, SandboxError> {
+  openat2_fd(
+    parent_fd,
+    leaf,
+    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+    0,
+    resolve_flags,
+  )
+}
+
+/// Directory descriptors that all concurrent recursive removals in this process
+/// may hold: at most MAX_TRAVERSAL_FDS, and at most a quarter of the current
+/// soft RLIMIT_NOFILE, so traversal can never starve the process's other
+/// descriptors whatever the caller's concurrency.
+pub fn traversal_fd_budget() -> usize {
+  let mut limit = libc::rlimit {
+    rlim_cur: 0,
+    rlim_max: 0,
+  };
+  if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0
+    || limit.rlim_cur == libc::RLIM_INFINITY
+  {
+    return MAX_TRAVERSAL_FDS;
+  }
+  usize::try_from(limit.rlim_cur / 4)
+    .unwrap_or(MAX_TRAVERSAL_FDS)
+    .clamp(1, MAX_TRAVERSAL_FDS)
+}
+
+/// One unit of the process-wide traversal descriptor budget, held for as long
+/// as the corresponding directory descriptor is open.
+struct TraversalPermit;
+
+impl TraversalPermit {
+  fn acquire() -> Result<Self, SandboxError> {
+    let budget = traversal_fd_budget();
+    if TRAVERSAL_FDS_IN_USE.fetch_add(1, Ordering::AcqRel) >= budget {
+      TRAVERSAL_FDS_IN_USE.fetch_sub(1, Ordering::AcqRel);
+      return Err(SandboxError::TraversalBudget(budget));
+    }
+    Ok(Self)
+  }
+}
+
+impl Drop for TraversalPermit {
+  fn drop(&mut self) {
+    TRAVERSAL_FDS_IN_USE.fetch_sub(1, Ordering::AcqRel);
+  }
+}
+
+/// A readdir stream that owns its directory descriptor and the budget permit
+/// for it. The permit field is dropped after Drop::drop closes the stream.
+struct DirStream {
+  dir: *mut libc::DIR,
+  _permit: TraversalPermit,
+}
+
+impl DirStream {
+  fn new(fd: OwnedFd, permit: TraversalPermit) -> Result<Self, SandboxError> {
+    let raw_fd = fd.into_raw_fd();
+    let dir = unsafe { libc::fdopendir(raw_fd) };
+    if dir.is_null() {
+      let err = io::Error::last_os_error();
+      let _ = unsafe { libc::close(raw_fd) };
+      return Err(SandboxError::Io(err));
+    }
+    Ok(Self {
+      dir,
+      _permit: permit,
+    })
   }
 
-  loop {
+  fn fd(&self) -> RawFd {
+    unsafe { libc::dirfd(self.dir) }
+  }
+
+  fn next_name(&mut self) -> Result<Option<CString>, SandboxError> {
+    loop {
+      unsafe {
+        *libc::__errno_location() = 0;
+      }
+      let entry = unsafe { libc::readdir(self.dir) };
+      if entry.is_null() {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(0) {
+          return Ok(None);
+        }
+        return Err(SandboxError::Io(err));
+      }
+      let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+      if name.to_bytes() == b"." || name.to_bytes() == b".." {
+        continue;
+      }
+      return Ok(Some(name.to_owned()));
+    }
+  }
+}
+
+impl Drop for DirStream {
+  fn drop(&mut self) {
     unsafe {
-      *libc::__errno_location() = 0;
+      libc::closedir(self.dir);
     }
-    let entry = unsafe { libc::readdir(dir_ptr) };
-    if entry.is_null() {
-      let errno = io::Error::last_os_error();
-      let closed = unsafe { libc::closedir(dir_ptr) };
-      if closed < 0 {
-        return Err(SandboxError::Io(io::Error::last_os_error()));
-      }
-      if errno.raw_os_error() == Some(0) {
-        return Ok(());
-      }
-      return Err(SandboxError::Io(errno));
-    }
+  }
+}
 
-    let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-    if name.to_bytes() == b"." || name.to_bytes() == b".." {
+/// Removes everything below `dir` without recursion: one heap frame and one
+/// budgeted descriptor per directory level, capped at MAX_REMOVE_DEPTH levels.
+fn remove_dir_contents(
+  dir: DirStream,
+  force: bool,
+  resolve_flags: u64,
+) -> Result<(), SandboxError> {
+  // Each frame is an open directory and its name in the parent frame.
+  let mut stack: Vec<(DirStream, Option<CString>)> = vec![(dir, None)];
+
+  while let Some((dir, _)) = stack.last_mut() {
+    let current_fd = dir.fd();
+    let Some(name) = dir.next_name()? else {
+      let (finished, name) = stack.pop().expect("stack is not empty");
+      drop(finished);
+      if let (Some(name), Some((parent, _))) = (name, stack.last()) {
+        unlinkat(parent.fd(), &name, libc::AT_REMOVEDIR)?;
+      }
       continue;
-    }
-    let c_name = CString::new(name.to_bytes())
-      .map_err(|_| SandboxError::InvalidPath("directory entry contains NUL byte".to_string()))?;
+    };
 
-    match unlinkat(dir_fd, &c_name, 0) {
+    match unlinkat(current_fd, &name, 0) {
       Ok(()) => continue,
       Err(SandboxError::Io(err)) if force && err.raw_os_error() == Some(libc::ENOENT) => {
         continue;
       }
       Err(SandboxError::Io(err))
         if matches!(err.raw_os_error(), Some(libc::EISDIR) | Some(libc::EPERM)) => {}
-      Err(err) => {
-        let _ = unsafe { libc::closedir(dir_ptr) };
-        return Err(err);
-      }
+      Err(err) => return Err(err),
     }
 
-    let child_dir_fd = match openat2_fd(
-      dir_fd,
-      &c_name,
-      libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-      0,
-      resolve_flags,
-    ) {
-      Ok(fd) => fd,
-      Err(err) => {
-        let _ = unsafe { libc::closedir(dir_ptr) };
-        return Err(err);
-      }
-    };
-
-    if let Err(err) = remove_dir_contents(child_dir_fd.as_raw_fd(), force, resolve_flags) {
-      let _ = unsafe { libc::closedir(dir_ptr) };
-      return Err(err);
+    if stack.len() >= MAX_REMOVE_DEPTH {
+      return Err(SandboxError::TooDeep(MAX_REMOVE_DEPTH));
     }
-
-    if let Err(err) = unlinkat(dir_fd, &c_name, libc::AT_REMOVEDIR) {
-      let _ = unsafe { libc::closedir(dir_ptr) };
-      return Err(err);
-    }
+    let permit = TraversalPermit::acquire()?;
+    let child = DirStream::new(open_child_dir(current_fd, &name, resolve_flags)?, permit)?;
+    stack.push((child, Some(name)));
   }
+
+  Ok(())
 }
 
 fn ns_to_timespec(ns: i64) -> libc::timespec {
@@ -817,6 +976,32 @@ mod tests {
   }
 
   #[test]
+  fn copy_file_rejects_same_path_without_truncating() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("a.txt"), b"abcdef").unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    let err = sandbox.copy_file("a.txt", "a.txt", 0o644).unwrap_err();
+
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+    assert_eq!(fs::read(root.path().join("a.txt")).unwrap(), b"abcdef");
+  }
+
+  #[test]
+  fn copy_file_rejects_hard_link_alias_without_truncating() {
+    let root = tempdir().unwrap();
+    fs::write(root.path().join("a.txt"), b"abcdef").unwrap();
+    fs::hard_link(root.path().join("a.txt"), root.path().join("b.txt")).unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    let err = sandbox.copy_file("a.txt", "b.txt", 0o644).unwrap_err();
+
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+    assert_eq!(fs::read(root.path().join("a.txt")).unwrap(), b"abcdef");
+    assert_eq!(fs::read(root.path().join("b.txt")).unwrap(), b"abcdef");
+  }
+
+  #[test]
   fn copy_file_noreplace_creates_destination() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("a.txt"), b"abcdef").unwrap();
@@ -889,11 +1074,7 @@ mod tests {
       results
         .iter()
         .filter(|result| {
-          result
-            .as_ref()
-            .err()
-            .and_then(SandboxError::raw_os_error)
-            == Some(libc::EEXIST)
+          result.as_ref().err().and_then(SandboxError::raw_os_error) == Some(libc::EEXIST)
         })
         .count(),
       1
@@ -928,8 +1109,28 @@ mod tests {
     assert_eq!(link_target, PathBuf::from("a.txt"));
   }
 
+  // Recursive removals share the process-wide traversal budget, so tests that
+  // remove trees run one at a time. Like Node at startup, raise the soft
+  // descriptor limit to the hard limit so the budget is not artificially small.
+  fn removal_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut limit = libc::rlimit {
+      rlim_cur: 0,
+      rlim_max: 0,
+    };
+    unsafe {
+      if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 && limit.rlim_cur < limit.rlim_max {
+        limit.rlim_cur = limit.rlim_max;
+        libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+      }
+    }
+    guard
+  }
+
   #[test]
   fn remove_recursive_removes_tree() {
+    let _guard = removal_guard();
     let root = tempdir().unwrap();
     fs::create_dir_all(root.path().join("d1/d2")).unwrap();
     fs::write(root.path().join("d1/d2/f.txt"), b"x").unwrap();
@@ -942,21 +1143,165 @@ mod tests {
 
   #[test]
   fn remove_recursive_does_not_follow_symlink() {
+    let _guard = removal_guard();
     let root = tempdir().unwrap();
     let outside = tempdir().unwrap();
     fs::create_dir_all(root.path().join("d1")).unwrap();
     fs::write(outside.path().join("secret.txt"), b"secret").unwrap();
-    std::os::unix::fs::symlink(
-      outside.path(),
-      root.path().join("d1/outside-link"),
-    )
-    .unwrap();
+    std::os::unix::fs::symlink(outside.path(), root.path().join("d1/outside-link")).unwrap();
 
     let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
     sandbox.remove("d1", true, false).unwrap();
 
     assert!(outside.path().join("secret.txt").exists());
     assert!(!root.path().join("d1").exists());
+  }
+
+  fn nested_dirs(top: &Path, levels: usize) -> PathBuf {
+    let mut path = top.to_path_buf();
+    for _ in 0..levels {
+      path.push("d");
+    }
+    fs::create_dir_all(&path).unwrap();
+    path
+  }
+
+  #[test]
+  fn remove_recursive_resumes_parent_after_subdirectories() {
+    let _guard = removal_guard();
+    let root = tempdir().unwrap();
+    for dir in ["t/a/b", "t/c", "t/e/f/g"] {
+      fs::create_dir_all(root.path().join(dir)).unwrap();
+    }
+    for file in [
+      "t/1",
+      "t/a/2",
+      "t/a/b/3",
+      "t/c/4",
+      "t/e/5",
+      "t/e/f/g/6",
+      "t/z",
+    ] {
+      fs::write(root.path().join(file), b"x").unwrap();
+    }
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    sandbox.remove("t", true, false).unwrap();
+
+    assert!(!root.path().join("t").exists());
+  }
+
+  #[test]
+  fn remove_recursive_allows_maximum_depth() {
+    let _guard = removal_guard();
+    if traversal_fd_budget() < MAX_REMOVE_DEPTH {
+      eprintln!("skipping: descriptor limit leaves a budget below MAX_REMOVE_DEPTH");
+      return;
+    }
+    let root = tempdir().unwrap();
+    let deepest = nested_dirs(&root.path().join("top"), MAX_REMOVE_DEPTH - 1);
+    fs::write(deepest.join("f.txt"), b"x").unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    sandbox.remove("top", true, false).unwrap();
+
+    assert!(!root.path().join("top").exists());
+  }
+
+  #[test]
+  fn remove_recursive_rejects_excessive_depth() {
+    let _guard = removal_guard();
+    let root = tempdir().unwrap();
+    nested_dirs(&root.path().join("top"), MAX_REMOVE_DEPTH);
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    let err = sandbox.remove("top", true, false).unwrap_err();
+
+    assert!(matches!(err, SandboxError::TooDeep(MAX_REMOVE_DEPTH)));
+    assert_eq!(err.raw_os_error(), Some(libc::ENAMETOOLONG));
+    assert!(root.path().join("top").exists());
+    assert_eq!(TRAVERSAL_FDS_IN_USE.load(Ordering::Acquire), 0);
+  }
+
+  #[test]
+  fn traversal_budget_respects_descriptor_limit() {
+    let budget = traversal_fd_budget();
+    assert!((1..=MAX_TRAVERSAL_FDS).contains(&budget));
+    let mut limit = libc::rlimit {
+      rlim_cur: 0,
+      rlim_max: 0,
+    };
+    assert_eq!(
+      unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+      0
+    );
+    if limit.rlim_cur != libc::RLIM_INFINITY {
+      assert!(budget as u64 <= (limit.rlim_cur / 4).max(1));
+    }
+  }
+
+  #[test]
+  fn remove_recursive_fails_cleanly_when_traversal_budget_is_exhausted() {
+    let _guard = removal_guard();
+    let root = tempdir().unwrap();
+    fs::create_dir_all(root.path().join("t/a")).unwrap();
+    fs::write(root.path().join("t/a/f.txt"), b"x").unwrap();
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+
+    // Hold the whole budget, as concurrent removals elsewhere could.
+    let mut held = Vec::new();
+    while let Ok(permit) = TraversalPermit::acquire() {
+      held.push(permit);
+    }
+    assert_eq!(held.len(), traversal_fd_budget());
+
+    let err = sandbox.remove("t", true, false).unwrap_err();
+    assert!(matches!(err, SandboxError::TraversalBudget(_)));
+    assert_eq!(err.raw_os_error(), Some(libc::EMFILE));
+    assert!(root.path().join("t/a/f.txt").exists());
+
+    drop(held);
+    assert_eq!(TRAVERSAL_FDS_IN_USE.load(Ordering::Acquire), 0);
+    sandbox.remove("t", true, false).unwrap();
+    assert!(!root.path().join("t").exists());
+    assert_eq!(TRAVERSAL_FDS_IN_USE.load(Ordering::Acquire), 0);
+  }
+
+  #[test]
+  fn chmod_and_utimes_do_not_require_read_permission() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = tempdir().unwrap();
+    let file = root.path().join("locked.txt");
+    fs::write(&file, b"x").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    sandbox
+      .utimes("locked.txt", 1_000_000_000, 2_000_000_000)
+      .unwrap();
+    sandbox.chmod("locked.txt", 0o640).unwrap();
+
+    let meta = fs::metadata(&file).unwrap();
+    assert_eq!(meta.mode() & 0o7777, 0o640);
+    assert_eq!(meta.mtime(), 2);
+  }
+
+  #[test]
+  fn chmod_and_utimes_do_not_open_fifos() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = tempdir().unwrap();
+    let fifo = cstring_from_os(root.path().join("fifo").as_os_str()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+
+    let sandbox = Sandbox::new(root.path().to_str().unwrap()).unwrap();
+    sandbox.chmod("fifo", 0o600).unwrap();
+    sandbox.utimes("fifo", 0, 3_000_000_000).unwrap();
+
+    let meta = fs::metadata(root.path().join("fifo")).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o600);
+    assert_eq!(meta.mtime(), 3);
   }
 
   #[test]

@@ -67,9 +67,9 @@ Methods implemented now:
 - `symlink(target, newPath)`
 - `chmod(path, mode)`
 - `truncate(path, len)`
-- `copyFile(src, dest, mode?)`
-- `copyFileNoReplace(src, dest)`
-- `rm(path, recursive?, force?)`
+- `copyFile(src, dest, mode?) -> Promise<void>`
+- `copyFileNoReplace(src, dest) -> Promise<void>`
+- `rm(path, recursive?, force?) -> Promise<void>`
 - `utimes(path, atimeNs, mtimeNs)`
 - `stat(path)`
 - `openRead(path) -> fd`
@@ -77,6 +77,21 @@ Methods implemented now:
 
 `openRead`/`openWrite` return numeric file descriptors intended for high-frequency
 I/O paths in Node. The caller owns the descriptor and must close it.
+
+`openRead`, `openWrite`, `truncate`, and the copy methods operate on regular
+files only. `copyFile`, `copyFileNoReplace`, and `rm` return Promises and run on
+the libuv worker pool, which is shared with Node's `fs`; callers should bound how
+many run at once. Recursive `rm` refuses trees nested more than 256 directories
+deep with `ENAMETOOLONG`. All recursive removals in a process share a budget of
+directory descriptors (at most 1024 and at most a quarter of the soft
+`RLIMIT_NOFILE`); a removal that would exceed it fails with `EMFILE` and can be
+retried.
+
+`chmod` and `utimes` act through an `O_PATH` handle and `/proc/self/fd`, so they
+do not open the file and do not need read permission. They require `/proc`.
+
+Errors are thrown with Node-style code prefixes such as `ENOENT: ...`; errno
+values without a known name use `UNKNOWN`.
 
 `copyFileNoReplace` copies into an unnamed file in the destination directory,
 then publishes it atomically only if the destination does not exist. It requires

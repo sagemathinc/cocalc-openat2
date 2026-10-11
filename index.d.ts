@@ -29,11 +29,11 @@ export declare class SandboxRoot {
   symlink(target: string, newPath: string): void
   chmod(path: string, mode: number): void
   truncate(path: string, len: number): void
-  copyFile(src: string, dest: string, mode?: number | undefined | null): void
-  copyFileNoReplace(src: string, dest: string): void
+  copyFile(src: string, dest: string, mode?: number | undefined | null): Promise<void>
+  copyFileNoReplace(src: string, dest: string): Promise<void>
   openRead(path: string): number
   openWrite(path: string, create?: boolean | undefined | null, truncate?: boolean | undefined | null, append?: boolean | undefined | null, mode?: number | undefined | null): number
-  rm(path: string, recursive?: boolean | undefined | null, force?: boolean | undefined | null): void
+  rm(path: string, recursive?: boolean | undefined | null, force?: boolean | undefined | null): Promise<void>
   utimes(path: string, atimeNs: number, mtimeNs: number): void
   stat(path: string): StatResult
 }

@@ -6,7 +6,8 @@ compile_error!("@cocalc/openat2 currently only supports Linux");
 mod core;
 
 use core::{FileStat, Sandbox, SandboxError};
-use napi::{Error, Result, Status};
+use napi::bindgen_prelude::AsyncTask;
+use napi::{Env, Error, Result, Status, Task};
 use napi_derive::napi;
 
 #[napi(object)]
@@ -49,6 +50,59 @@ impl From<FileStat> for StatResult {
 #[napi]
 pub struct SandboxRoot {
   inner: Sandbox,
+}
+
+#[derive(Clone, Copy)]
+enum CopyMode {
+  Replace { mode: u32 },
+  NoReplace,
+}
+
+pub struct CopyFileTask {
+  sandbox: Sandbox,
+  src: String,
+  dest: String,
+  mode: CopyMode,
+}
+
+impl Task for CopyFileTask {
+  type Output = ();
+  type JsValue = ();
+
+  fn compute(&mut self) -> Result<Self::Output> {
+    match self.mode {
+      CopyMode::Replace { mode } => self.sandbox.copy_file(&self.src, &self.dest, mode),
+      CopyMode::NoReplace => self.sandbox.copy_file_noreplace(&self.src, &self.dest),
+    }
+    .map_err(map_error)
+  }
+
+  fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
+    Ok(())
+  }
+}
+
+pub struct RemoveTask {
+  sandbox: Sandbox,
+  path: String,
+  recursive: bool,
+  force: bool,
+}
+
+impl Task for RemoveTask {
+  type Output = ();
+  type JsValue = ();
+
+  fn compute(&mut self) -> Result<Self::Output> {
+    self
+      .sandbox
+      .remove(&self.path, self.recursive, self.force)
+      .map_err(map_error)
+  }
+
+  fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
+    Ok(())
+  }
 }
 
 #[napi]
@@ -111,20 +165,31 @@ impl SandboxRoot {
     self.inner.truncate(&path, len).map_err(map_error)
   }
 
-  #[napi]
-  pub fn copy_file(&self, src: String, dest: String, mode: Option<u32>) -> Result<()> {
-    self
-      .inner
-      .copy_file(&src, &dest, mode.unwrap_or(0o644))
-      .map_err(map_error)
+  #[napi(ts_return_type = "Promise<void>")]
+  pub fn copy_file(
+    &self,
+    src: String,
+    dest: String,
+    mode: Option<u32>,
+  ) -> Result<AsyncTask<CopyFileTask>> {
+    Ok(AsyncTask::new(CopyFileTask {
+      sandbox: self.inner.try_clone().map_err(map_error)?,
+      src,
+      dest,
+      mode: CopyMode::Replace {
+        mode: mode.unwrap_or(0o644),
+      },
+    }))
   }
 
-  #[napi]
-  pub fn copy_file_no_replace(&self, src: String, dest: String) -> Result<()> {
-    self
-      .inner
-      .copy_file_noreplace(&src, &dest)
-      .map_err(map_error)
+  #[napi(ts_return_type = "Promise<void>")]
+  pub fn copy_file_no_replace(&self, src: String, dest: String) -> Result<AsyncTask<CopyFileTask>> {
+    Ok(AsyncTask::new(CopyFileTask {
+      sandbox: self.inner.try_clone().map_err(map_error)?,
+      src,
+      dest,
+      mode: CopyMode::NoReplace,
+    }))
   }
 
   #[napi]
@@ -158,12 +223,19 @@ impl SandboxRoot {
       .map_err(map_error)
   }
 
-  #[napi]
-  pub fn rm(&self, path: String, recursive: Option<bool>, force: Option<bool>) -> Result<()> {
-    self
-      .inner
-      .remove(&path, recursive.unwrap_or(false), force.unwrap_or(false))
-      .map_err(map_error)
+  #[napi(ts_return_type = "Promise<void>")]
+  pub fn rm(
+    &self,
+    path: String,
+    recursive: Option<bool>,
+    force: Option<bool>,
+  ) -> Result<AsyncTask<RemoveTask>> {
+    Ok(AsyncTask::new(RemoveTask {
+      sandbox: self.inner.try_clone().map_err(map_error)?,
+      path,
+      recursive: recursive.unwrap_or(false),
+      force: force.unwrap_or(false),
+    }))
   }
 
   #[napi]
@@ -190,21 +262,52 @@ fn map_error(err: SandboxError) -> Error {
   Error::new(Status::GenericFailure, message)
 }
 
+// Codes match Node's names for the same errno. Unknown values report
+// "UNKNOWN" (as libuv does) rather than a misleading specific code.
 fn errno_to_code(errno: i32) -> &'static str {
   match errno {
-    libc::EACCES => "EACCES",
     libc::EPERM => "EPERM",
     libc::ENOENT => "ENOENT",
+    libc::EINTR => "EINTR",
+    libc::EIO => "EIO",
+    libc::ENXIO => "ENXIO",
+    libc::E2BIG => "E2BIG",
+    libc::EBADF => "EBADF",
+    libc::EAGAIN => "EAGAIN",
+    libc::ENOMEM => "ENOMEM",
+    libc::EACCES => "EACCES",
+    libc::EFAULT => "EFAULT",
+    libc::EBUSY => "EBUSY",
+    libc::EEXIST => "EEXIST",
+    libc::EXDEV => "EXDEV",
+    libc::ENODEV => "ENODEV",
     libc::ENOTDIR => "ENOTDIR",
     libc::EISDIR => "EISDIR",
     libc::EINVAL => "EINVAL",
-    libc::EEXIST => "EEXIST",
-    libc::ENOTEMPTY => "ENOTEMPTY",
-    libc::EBUSY => "EBUSY",
+    libc::ENFILE => "ENFILE",
+    libc::EMFILE => "EMFILE",
+    libc::ENOTTY => "ENOTTY",
+    libc::ETXTBSY => "ETXTBSY",
+    libc::EFBIG => "EFBIG",
+    libc::ENOSPC => "ENOSPC",
+    libc::ESPIPE => "ESPIPE",
+    libc::EROFS => "EROFS",
+    libc::EMLINK => "EMLINK",
+    libc::EPIPE => "EPIPE",
+    libc::ERANGE => "ERANGE",
+    libc::EDEADLK => "EDEADLK",
+    libc::ENAMETOOLONG => "ENAMETOOLONG",
+    libc::ENOLCK => "ENOLCK",
     libc::ENOSYS => "ENOSYS",
-    libc::EXDEV => "EXDEV",
+    libc::ENOTEMPTY => "ENOTEMPTY",
     libc::ELOOP => "ELOOP",
+    libc::ENODATA => "ENODATA",
+    libc::EOVERFLOW => "EOVERFLOW",
+    libc::EILSEQ => "EILSEQ",
     libc::EOPNOTSUPP => "ENOTSUP",
-    _ => "EIO",
+    libc::ESTALE => "ESTALE",
+    libc::EDQUOT => "EDQUOT",
+    libc::ECANCELED => "ECANCELED",
+    _ => "UNKNOWN",
   }
 }
